@@ -30,7 +30,6 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
-import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -159,8 +158,8 @@ public final class DiskLruCache implements Closeable {
   private long nextSequenceNumber = 0;
 
   /** This cache uses a single background thread to evict entries. */
-  final ThreadPoolExecutor executorService =
-      new ThreadPoolExecutor(0, 1, 60L, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>());
+  final ThreadPoolExecutor executorService = new ThreadPoolExecutor(0, 1, 60L, TimeUnit.SECONDS,
+      new LinkedBlockingQueue<Runnable>(), Util.threadFactory("OkHttp DiskLruCache", true));
   private final Callable<Void> cleanupCallable = new Callable<Void>() {
     public Void call() throws Exception {
       synchronized (DiskLruCache.this) {
@@ -562,7 +561,7 @@ public final class DiskLruCache implements Closeable {
    */
   private boolean journalRebuildRequired() {
     final int redundantOpCompactThreshold = 2000;
-    return redundantOpCount >= redundantOpCompactThreshold //
+    return redundantOpCount >= redundantOpCompactThreshold
         && redundantOpCount >= lruEntries.size();
   }
 
@@ -623,7 +622,9 @@ public final class DiskLruCache implements Closeable {
     if (journalWriter == null) {
       return; // Already closed.
     }
-    for (Entry entry : new ArrayList<Entry>(lruEntries.values())) {
+    // Copying for safe iteration.
+    for (Object next : lruEntries.values().toArray()) {
+      Entry entry = (Entry) next;
       if (entry.currentEditor != null) {
         entry.currentEditor.abort();
       }

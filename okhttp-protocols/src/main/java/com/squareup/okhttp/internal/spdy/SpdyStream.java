@@ -29,6 +29,7 @@ import static com.squareup.okhttp.internal.Util.checkOffsetAndCount;
 
 /** A logical bidirectional stream. */
 public final class SpdyStream {
+  static final int OUTPUT_BUFFER_SIZE = 8192;
 
   // Internal state is guarded by this. No long-running or potentially
   // blocking operations are performed while the lock is held.
@@ -39,22 +40,22 @@ public final class SpdyStream {
    * window size, otherwise the remote peer will stop sending data on this
    * stream. (Chrome 25 uses 5 MiB.)
    */
-  public static final int WINDOW_UPDATE_THRESHOLD = Settings.DEFAULT_INITIAL_WINDOW_SIZE / 2;
+  int windowUpdateThreshold;
+  private int writeWindowSize;
 
   private final int id;
   private final SpdyConnection connection;
   private final int priority;
   private long readTimeoutMillis = 0;
-  private int writeWindowSize;
 
   /** Headers sent by the stream initiator. Immutable and non null. */
-  private final List<String> requestHeaders;
+  private final List<Header> requestHeaders;
 
   /** Headers sent in the stream reply. Null if reply is either not sent or not sent yet. */
-  private List<String> responseHeaders;
+  private List<Header> responseHeaders;
 
-  private final SpdyDataInputStream in = new SpdyDataInputStream();
-  private final SpdyDataOutputStream out = new SpdyDataOutputStream();
+  private final SpdyDataInputStream in;
+  private final SpdyDataOutputStream out;
 
   /**
    * The reason why this stream was abnormally closed. If there are multiple
@@ -64,17 +65,18 @@ public final class SpdyStream {
   private ErrorCode errorCode = null;
 
   SpdyStream(int id, SpdyConnection connection, boolean outFinished, boolean inFinished,
-      int priority, List<String> requestHeaders, Settings settings) {
+      int priority, List<Header> requestHeaders, Settings peerSettings) {
     if (connection == null) throw new NullPointerException("connection == null");
     if (requestHeaders == null) throw new NullPointerException("requestHeaders == null");
     this.id = id;
     this.connection = connection;
+    this.in = new SpdyDataInputStream(peerSettings.getInitialWindowSize());
+    this.out = new SpdyDataOutputStream();
     this.in.finished = inFinished;
     this.out.finished = outFinished;
     this.priority = priority;
     this.requestHeaders = requestHeaders;
-
-    setSettings(settings);
+    setPeerSettings(peerSettings);
   }
 
   /**
@@ -107,7 +109,7 @@ public final class SpdyStream {
     return connection;
   }
 
-  public List<String> getRequestHeaders() {
+  public List<Header> getRequestHeaders() {
     return requestHeaders;
   }
 
@@ -115,10 +117,24 @@ public final class SpdyStream {
    * Returns the stream's response headers, blocking if necessary if they
    * have not been received yet.
    */
-  public synchronized List<String> getResponseHeaders() throws IOException {
+  public synchronized List<Header> getResponseHeaders() throws IOException {
+    long remaining = 0;
+    long start = 0;
+    if (readTimeoutMillis != 0) {
+      start = (System.nanoTime() / 1000000);
+      remaining = readTimeoutMillis;
+    }
     try {
       while (responseHeaders == null && errorCode == null) {
-        wait();
+        if (readTimeoutMillis == 0) { // No timeout configured.
+          wait();
+        } else if (remaining > 0) {
+          wait(remaining);
+          remaining = start + readTimeoutMillis - (System.nanoTime() / 1000000);
+        } else {
+          throw new SocketTimeoutException("Read response header timeout. readTimeoutMillis: "
+                            + readTimeoutMillis);
+        }
       }
       if (responseHeaders != null) {
         return responseHeaders;
@@ -145,7 +161,7 @@ public final class SpdyStream {
    * @param out true to create an output stream that we can use to send data
    * to the remote peer. Corresponds to {@code FLAG_FIN}.
    */
-  public void reply(List<String> responseHeaders, boolean out) throws IOException {
+  public void reply(List<Header> responseHeaders, boolean out) throws IOException {
     assert (!Thread.holdsLock(SpdyStream.this));
     boolean outFinished = false;
     synchronized (this) {
@@ -238,7 +254,7 @@ public final class SpdyStream {
     return true;
   }
 
-  void receiveHeaders(List<String> headers, HeadersMode headersMode) {
+  void receiveHeaders(List<Header> headers, HeadersMode headersMode) {
     assert (!Thread.holdsLock(SpdyStream.this));
     ErrorCode errorCode = null;
     boolean open = true;
@@ -255,7 +271,7 @@ public final class SpdyStream {
         if (headersMode.failIfHeadersPresent()) {
           errorCode = ErrorCode.STREAM_IN_USE;
         } else {
-          List<String> newHeaders = new ArrayList<String>();
+          List<Header> newHeaders = new ArrayList<Header>();
           newHeaders.addAll(responseHeaders);
           newHeaders.addAll(headers);
           this.responseHeaders = newHeaders;
@@ -294,23 +310,23 @@ public final class SpdyStream {
     }
   }
 
-  private void setSettings(Settings settings) {
+  private void setPeerSettings(Settings peerSettings) {
     // TODO: For HTTP/2.0, also adjust the stream flow control window size
     // by the difference between the new value and the old value.
     assert (Thread.holdsLock(connection)); // Because 'settings' is guarded by 'connection'.
-    this.writeWindowSize = settings != null
-        ? settings.getInitialWindowSize(Settings.DEFAULT_INITIAL_WINDOW_SIZE)
-        : Settings.DEFAULT_INITIAL_WINDOW_SIZE;
+    this.writeWindowSize = peerSettings.getInitialWindowSize();
+    this.windowUpdateThreshold = peerSettings.getInitialWindowSize() / 2;
   }
 
-  void receiveSettings(Settings settings) {
+  /** Notification received when peer settings change. */
+  void receiveSettings(Settings peerSettings) {
     assert (Thread.holdsLock(this));
-    setSettings(settings);
+    setPeerSettings(peerSettings);
     notifyAll();
   }
 
-  synchronized void receiveWindowUpdate(int deltaWindowSize) {
-    out.unacknowledgedBytes -= deltaWindowSize;
+  synchronized void receiveWindowUpdate(long windowSizeIncrement) {
+    out.unacknowledgedBytes -= windowSizeIncrement;
     notifyAll();
   }
 
@@ -324,6 +340,7 @@ public final class SpdyStream {
    * it is not intended for use by multiple readers.
    */
   private final class SpdyDataInputStream extends InputStream {
+
     // Store incoming data bytes in a circular buffer. When the buffer is
     // empty, pos == -1. Otherwise pos is the first byte to read and limit
     // is the first byte to write.
@@ -335,8 +352,13 @@ public final class SpdyStream {
     // { X X X - - - - X X X }
     //         ^       ^
     //       limit    pos
+    private final byte[] buffer;
 
-    private final byte[] buffer = new byte[Settings.DEFAULT_INITIAL_WINDOW_SIZE];
+    private SpdyDataInputStream(int bufferLength) {
+      // TODO: We probably need to change to growable buffers here pretty soon.
+      // Otherwise we have a performance problem where we pay for 64 KiB even if we aren't using it.
+      buffer = connection.bufferPool.getBuf(bufferLength);
+    }
 
     /** the next byte to be read, or -1 if the buffer is empty. Never buffer.length */
     private int pos = -1;
@@ -410,7 +432,7 @@ public final class SpdyStream {
 
         // Flow control: notify the peer that we're ready for more data!
         unacknowledgedBytes += copied;
-        if (unacknowledgedBytes >= WINDOW_UPDATE_THRESHOLD) {
+        if (unacknowledgedBytes >= windowUpdateThreshold) {
           connection.writeWindowUpdateLater(id, unacknowledgedBytes);
           unacknowledgedBytes = 0;
         }
@@ -516,6 +538,7 @@ public final class SpdyStream {
       synchronized (SpdyStream.this) {
         closed = true;
         SpdyStream.this.notifyAll();
+        SpdyStream.this.connection.bufferPool.returnBuf(buffer);
       }
       cancelStreamIfNecessary();
     }
@@ -554,7 +577,7 @@ public final class SpdyStream {
    * is not thread safe.
    */
   private final class SpdyDataOutputStream extends OutputStream {
-    private final byte[] buffer = new byte[8192];
+    private final byte[] buffer = SpdyStream.this.connection.bufferPool.getBuf(OUTPUT_BUFFER_SIZE);
     private int pos = 0;
 
     /** True if the caller has closed this stream. */
@@ -571,7 +594,7 @@ public final class SpdyStream {
      * acknowledged with an incoming {@code WINDOW_UPDATE} frame. Writes
      * block if they cause this to exceed the {@code WINDOW_SIZE}.
      */
-    private int unacknowledgedBytes = 0;
+    private long unacknowledgedBytes = 0;
 
     @Override public void write(int b) throws IOException {
       Util.writeSingleByte(this, b);
@@ -610,6 +633,7 @@ public final class SpdyStream {
           return;
         }
         closed = true;
+        SpdyStream.this.connection.bufferPool.returnBuf(buffer);
       }
       if (!out.finished) {
         writeFrame(true);

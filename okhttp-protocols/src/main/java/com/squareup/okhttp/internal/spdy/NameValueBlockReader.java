@@ -1,5 +1,6 @@
 package com.squareup.okhttp.internal.spdy;
 
+import com.squareup.okhttp.internal.ByteString;
 import com.squareup.okhttp.internal.Util;
 import java.io.Closeable;
 import java.io.DataInputStream;
@@ -18,7 +19,7 @@ import java.util.zip.InflaterInputStream;
  * bytes.
  */
 class NameValueBlockReader implements Closeable {
-  private final DataInputStream nameValueBlockIn;
+  private final DataInputStream headerBlockIn;
   private final FillableInflaterInputStream fillableInflaterInputStream;
   private int compressedLimit;
 
@@ -57,7 +58,7 @@ class NameValueBlockReader implements Closeable {
     };
 
     fillableInflaterInputStream = new FillableInflaterInputStream(throttleStream, inflater);
-    nameValueBlockIn = new DataInputStream(fillableInflaterInputStream);
+    headerBlockIn = new DataInputStream(fillableInflaterInputStream);
   }
 
   /** Extend the inflater stream so we can eagerly fill the compressed bytes buffer if necessary. */
@@ -71,31 +72,26 @@ class NameValueBlockReader implements Closeable {
     }
   }
 
-  public List<String> readNameValueBlock(int length) throws IOException {
+  public List<Header> readNameValueBlock(int length) throws IOException {
     this.compressedLimit += length;
-    try {
-      int numberOfPairs = nameValueBlockIn.readInt();
-      if (numberOfPairs < 0) {
-        throw new IOException("numberOfPairs < 0: " + numberOfPairs);
-      }
-      if (numberOfPairs > 1024) {
-        throw new IOException("numberOfPairs > 1024: " + numberOfPairs);
-      }
-      List<String> entries = new ArrayList<String>(numberOfPairs * 2);
-      for (int i = 0; i < numberOfPairs; i++) {
-        String name = readString();
-        String values = readString();
-        if (name.length() == 0) throw new IOException("name.length == 0");
-        entries.add(name);
-        entries.add(values);
-      }
-
-      doneReading();
-
-      return entries;
-    } catch (DataFormatException e) {
-      throw new IOException(e.getMessage());
+    int numberOfPairs = headerBlockIn.readInt();
+    if (numberOfPairs < 0) {
+      throw new IOException("numberOfPairs < 0: " + numberOfPairs);
     }
+    if (numberOfPairs > 1024) {
+      throw new IOException("numberOfPairs > 1024: " + numberOfPairs);
+    }
+    List<Header> entries = new ArrayList<Header>(numberOfPairs);
+    for (int i = 0; i < numberOfPairs; i++) {
+      ByteString name = ByteString.readLowerCase(headerBlockIn, headerBlockIn.readInt());
+      ByteString values = ByteString.read(headerBlockIn, headerBlockIn.readInt());
+      if (name.size() == 0) throw new IOException("name.size == 0");
+      entries.add(new Header(name, values));
+    }
+
+    doneReading();
+
+    return entries;
   }
 
   private void doneReading() throws IOException {
@@ -110,14 +106,7 @@ class NameValueBlockReader implements Closeable {
     }
   }
 
-  private String readString() throws DataFormatException, IOException {
-    int length = nameValueBlockIn.readInt();
-    byte[] bytes = new byte[length];
-    Util.readFully(nameValueBlockIn, bytes);
-    return new String(bytes, 0, length, "UTF-8");
-  }
-
   @Override public void close() throws IOException {
-    nameValueBlockIn.close();
+    headerBlockIn.close();
   }
 }

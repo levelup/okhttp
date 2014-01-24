@@ -82,7 +82,7 @@ public class ConnectionPool {
   /** We use a single background thread to cleanup expired connections. */
   private final ExecutorService executorService = new ThreadPoolExecutor(0, 1,
       60L, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(),
-      Util.daemonThreadFactory("OkHttp ConnectionPool"));
+      Util.threadFactory("OkHttp ConnectionPool", true));
   private final Callable<Void> connectionsCleanupCallable = new Callable<Void>() {
     @Override public Void call() throws Exception {
       List<Connection> expiredConnections = new ArrayList<Connection>(MAX_CONNECTIONS_TO_CLEANUP);
@@ -267,8 +267,8 @@ public class ConnectionPool {
       this.connections.clear();
     }
 
-    for (Connection connection : connections) {
-      Util.closeQuietly(connection);
+    for (int i = 0, size = connections.size(); i < size; i++) {
+      Util.closeQuietly(connections.get(i));
     }
   }
 }
