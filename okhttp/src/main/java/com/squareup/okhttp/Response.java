@@ -32,6 +32,8 @@ import java.util.Date;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import okio.Okio;
+import okio.Source;
 
 import static com.squareup.okhttp.internal.Util.UTF_8;
 import static com.squareup.okhttp.internal.Util.equal;
@@ -189,9 +191,12 @@ public final class Response {
     /** Multiple calls to {@link #charStream()} must return the same instance. */
     private Reader reader;
 
+    /** Multiple calls to {@link #source()} must return the same instance. */
+    private Source source;
+
     /**
      * Returns true if further data from this response body should be read at
-     * this time. For asynchronous protocols like SPDY and HTTP/2.0, this will
+     * this time. For asynchronous protocols like SPDY and HTTP/2, this will
      * return false once all locally-available body bytes have been read.
      *
      * <p>Clients with many concurrent downloads can use this method to reduce
@@ -212,6 +217,12 @@ public final class Response {
     public abstract long contentLength();
 
     public abstract InputStream byteStream();
+
+    // TODO: Source needs to be an API type for this to be public
+    public Source source() {
+      Source s = source;
+      return s != null ? s : (source = Okio.source(byteStream()));
+    }
 
     public final byte[] bytes() throws IOException {
       long contentLength = contentLength();
@@ -239,10 +250,8 @@ public final class Response {
      * charset, this will attempt to decode the response body as UTF-8.
      */
     public final Reader charStream() {
-      if (reader == null) {
-        reader = new InputStreamReader(byteStream(), charset());
-      }
-      return reader;
+      Reader r = reader;
+      return r != null ? r : (reader = new InputStreamReader(byteStream(), charset()));
     }
 
     /**

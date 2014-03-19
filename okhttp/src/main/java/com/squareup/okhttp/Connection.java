@@ -16,23 +16,19 @@
  */
 package com.squareup.okhttp;
 
-import com.squareup.okhttp.internal.ByteString;
 import com.squareup.okhttp.internal.Platform;
 import com.squareup.okhttp.internal.http.HttpAuthenticator;
+import com.squareup.okhttp.internal.http.HttpConnection;
 import com.squareup.okhttp.internal.http.HttpEngine;
 import com.squareup.okhttp.internal.http.HttpTransport;
 import com.squareup.okhttp.internal.http.SpdyTransport;
 import com.squareup.okhttp.internal.spdy.SpdyConnection;
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.Proxy;
 import java.net.Socket;
-import java.net.SocketTimeoutException;
 import javax.net.ssl.SSLSocket;
+import okio.ByteString;
 
 import static java.net.HttpURLConnection.HTTP_OK;
 import static java.net.HttpURLConnection.HTTP_PROXY_AUTH;
@@ -64,19 +60,20 @@ import static java.net.HttpURLConnection.HTTP_PROXY_AUTH;
  * should the attempt fail.
  */
 public final class Connection implements Closeable {
-
+  private final ConnectionPool pool;
   private final Route route;
 
   private Socket socket;
-  private InputStream in;
-  private OutputStream out;
   private boolean connected = false;
+  private HttpConnection httpConnection;
   private SpdyConnection spdyConnection;
   private int httpMinorVersion = 1; // Assume HTTP/1.1
   private long idleStartTimeNs;
   private Handshake handshake;
+  private int recycleCount;
 
-  public Connection(Route route) {
+  public Connection(ConnectionPool pool, Route route) {
+    this.pool = pool;
     this.route = route;
   }
 
@@ -87,13 +84,11 @@ public final class Connection implements Closeable {
     socket = (route.proxy.type() != Proxy.Type.HTTP) ? new Socket(route.proxy) : new Socket();
     Platform.get().connectSocket(socket, route.inetSocketAddress, connectTimeout);
     socket.setSoTimeout(readTimeout);
-    in = socket.getInputStream();
-    out = socket.getOutputStream();
 
     if (route.address.sslSocketFactory != null) {
       upgradeToTls(tunnelRequest);
     } else {
-      streamWrapper();
+      httpConnection = new HttpConnection(pool, this, socket);
     }
     connected = true;
   }
@@ -120,19 +115,19 @@ public final class Connection implements Closeable {
       platform.supportTlsIntolerantServer(sslSocket);
     }
 
-    boolean useNpn = route.modernTls && (// Contains a spdy variant.
-        route.address.protocols.contains(Protocol.HTTP_2)
-     || route.address.protocols.contains(Protocol.SPDY_3)
-    );
-
-    if (useNpn) {
-      if (route.address.protocols.contains(Protocol.HTTP_2) // Contains both spdy variants.
-          && route.address.protocols.contains(Protocol.SPDY_3)) {
+    boolean useNpn = false;
+    if (route.modernTls) {
+      boolean http2 = route.address.protocols.contains(Protocol.HTTP_2);
+      boolean spdy3 = route.address.protocols.contains(Protocol.SPDY_3);
+      if (http2 && spdy3) {
         platform.setNpnProtocols(sslSocket, Protocol.HTTP2_SPDY3_AND_HTTP);
-      } else if (route.address.protocols.contains(Protocol.HTTP_2)) {
+        useNpn = true;
+      } else if (http2) {
         platform.setNpnProtocols(sslSocket, Protocol.HTTP2_AND_HTTP_11);
-      } else {
+        useNpn = true;
+      } else if (spdy3) {
         platform.setNpnProtocols(sslSocket, Protocol.SPDY3_AND_HTTP11);
+        useNpn = true;
       }
     }
 
@@ -144,20 +139,21 @@ public final class Connection implements Closeable {
       throw new IOException("Hostname '" + route.address.uriHost + "' was not verified");
     }
 
-    out = sslSocket.getOutputStream();
-    in = sslSocket.getInputStream();
     handshake = Handshake.get(sslSocket.getSession());
-    streamWrapper();
 
     ByteString maybeProtocol;
+    Protocol selectedProtocol = Protocol.HTTP_11;
     if (useNpn && (maybeProtocol = platform.getNpnSelectedProtocol(sslSocket)) != null) {
-      Protocol selectedProtocol = Protocol.find(maybeProtocol); // Throws IOE on unknown.
-      if (selectedProtocol.spdyVariant) {
-        sslSocket.setSoTimeout(0); // SPDY timeouts are set per-stream.
-        spdyConnection = new SpdyConnection.Builder(route.address.getUriHost(), true, in, out)
-            .protocol(selectedProtocol).build();
-        spdyConnection.sendConnectionHeader();
-      }
+      selectedProtocol = Protocol.find(maybeProtocol); // Throws IOE on unknown.
+    }
+
+    if (selectedProtocol.spdyVariant) {
+      sslSocket.setSoTimeout(0); // SPDY timeouts are set per-stream.
+      spdyConnection = new SpdyConnection.Builder(route.address.getUriHost(), true, socket)
+          .protocol(selectedProtocol).build();
+      spdyConnection.sendConnectionHeader();
+    } else {
+      httpConnection = new HttpConnection(pool, this, socket);
     }
   }
 
@@ -194,31 +190,8 @@ public final class Connection implements Closeable {
    * #isAlive()}; callers should check {@link #isAlive()} first.
    */
   public boolean isReadable() {
-    if (!(in instanceof BufferedInputStream)) {
-      return true; // Optimistic.
-    }
-    if (isSpdy()) {
-      return true; // Optimistic. We can't test SPDY because its streams are in use.
-    }
-    BufferedInputStream bufferedInputStream = (BufferedInputStream) in;
-    try {
-      int readTimeout = socket.getSoTimeout();
-      try {
-        socket.setSoTimeout(1);
-        bufferedInputStream.mark(1);
-        if (bufferedInputStream.read() == -1) {
-          return false; // Stream is exhausted; socket is closed.
-        }
-        bufferedInputStream.reset();
-        return true;
-      } finally {
-        socket.setSoTimeout(readTimeout);
-      }
-    } catch (SocketTimeoutException ignored) {
-      return true; // Read timed out; socket is good.
-    } catch (IOException e) {
-      return false; // Couldn't read; socket is closed.
-    }
+    if (httpConnection != null) return httpConnection.isReadable();
+    return true; // SPDY connections, and connections before connect() are both optimistic.
   }
 
   public void resetIdleStartTime() {
@@ -255,7 +228,7 @@ public final class Connection implements Closeable {
   public Object newTransport(HttpEngine httpEngine) throws IOException {
     return (spdyConnection != null)
         ? new SpdyTransport(httpEngine, spdyConnection)
-        : new HttpTransport(httpEngine, out, in);
+        : new HttpTransport(httpEngine, httpConnection);
   }
 
   /**
@@ -293,35 +266,52 @@ public final class Connection implements Closeable {
     socket.setSoTimeout(newTimeout);
   }
 
+  public void incrementRecycleCount() {
+    recycleCount++;
+  }
+
+  /**
+   * Returns the number of times this connection has been returned to the
+   * connection pool.
+   */
+  public int recycleCount() {
+    return recycleCount;
+  }
+
   /**
    * To make an HTTPS connection over an HTTP proxy, send an unencrypted
    * CONNECT request to create the proxy connection. This may need to be
    * retried if the proxy requires authorization.
    */
   private void makeTunnel(TunnelRequest tunnelRequest) throws IOException {
+    HttpConnection tunnelConnection = new HttpConnection(pool, this, socket);
     Request request = tunnelRequest.getRequest();
     String requestLine = tunnelRequest.requestLine();
     while (true) {
-      HttpTransport.writeRequest(out, request.headers(), requestLine);
-      Response response = HttpTransport.readResponse(in).request(request).build();
+      tunnelConnection.writeRequest(request.headers(), requestLine);
+      tunnelConnection.flush();
+      Response response = tunnelConnection.readResponse().request(request).build();
+      tunnelConnection.emptyResponseBody();
 
       switch (response.code()) {
         case HTTP_OK:
+          // Assume the server won't send a TLS ServerHello until we send a TLS ClientHello. If that
+          // happens, then we will have buffered bytes that are needed by the SSLSocket!
+          if (tunnelConnection.bufferSize() > 0) {
+            throw new IOException("TLS tunnel buffered too many bytes!");
+          }
           return;
+
         case HTTP_PROXY_AUTH:
           request = HttpAuthenticator.processAuthHeader(
               route.address.authenticator, response, route.proxy);
           if (request != null) continue;
           throw new IOException("Failed to authenticate with proxy");
+
         default:
           throw new IOException(
               "Unexpected response code for CONNECT: " + response.code());
       }
     }
-  }
-
-  private void streamWrapper() throws IOException {
-    in = new BufferedInputStream(in, 4096);
-    out = new BufferedOutputStream(out, 256);
   }
 }

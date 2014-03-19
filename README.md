@@ -24,6 +24,14 @@ Download [the latest JAR][2] or grab via Maven:
 Building
 --------
 
+OkHttp requires Java 7 to build and run tests. Runtime compatibility with Java 6 is enforced as
+part of the build to ensure compliance with Android and older versions of the JVM.
+
+
+
+Testing
+-------
+
 ### On the Desktop
 
 Run OkHttp tests on the desktop with Maven. Running SPDY tests on the desktop uses
@@ -92,7 +100,7 @@ License
 
 
  [1]: http://square.github.io/okhttp
- [2]: http://repository.sonatype.org/service/local/artifact/maven/redirect?r=central-proxy&g=com.squareup.okhttp&a=okhttp&v=LATEST&c=jar-with-dependencies
+ [2]: http://repository.sonatype.org/service/local/artifact/maven/redirect?r=central-proxy&g=com.squareup.okhttp&a=okhttp&v=LATEST
  [3]: http://wiki.eclipse.org/Jetty/Feature/NPN
  [4]: https://code.google.com/p/vogar/
- [5]: http://repository.sonatype.org/service/local/artifact/maven/redirect?r=central-proxy&g=com.squareup.okhttp&a=mockwebserver&v=LATEST&c=jar-with-dependencies
+ [5]: http://repository.sonatype.org/service/local/artifact/maven/redirect?r=central-proxy&g=com.squareup.okhttp&a=mockwebserver&v=LATEST

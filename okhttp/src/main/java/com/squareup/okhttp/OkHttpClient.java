@@ -15,11 +15,11 @@
  */
 package com.squareup.okhttp;
 
-import com.squareup.okhttp.internal.ByteString;
 import com.squareup.okhttp.internal.Util;
 import com.squareup.okhttp.internal.http.HttpAuthenticator;
 import com.squareup.okhttp.internal.http.HttpURLConnectionImpl;
 import com.squareup.okhttp.internal.http.HttpsURLConnectionImpl;
+import com.squareup.okhttp.internal.http.ResponseCacheAdapter;
 import com.squareup.okhttp.internal.tls.OkHostnameVerifier;
 import java.io.IOException;
 import java.net.CookieHandler;
@@ -31,14 +31,26 @@ import java.net.URL;
 import java.net.URLConnection;
 import java.net.URLStreamHandler;
 import java.net.URLStreamHandlerFactory;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.HostnameVerifier;
-import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
+import okio.ByteString;
 
-/** Configures and creates HTTP connections. */
+/**
+ * Configures and creates HTTP connections. Most applications can use a single
+ * OkHttpClient for all of their HTTP requests - benefiting from a shared
+ * response cache, thread pool, connection re-use, etc.
+ *
+ * Instances of OkHttpClient are intended to be fully configured before they're
+ * shared - once shared they should be treated as immutable and can safely be used
+ * to concurrently open new connections. If required, threads can call
+ * {@link #clone()} to make a shallow copy of the OkHttpClient that can be
+ * safely modified with further configuration changes.
+ */
 public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
 
   private final RouteDatabase routeDatabase;
@@ -160,34 +172,15 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
 
   /**
    * Sets the response cache to be used to read and write cached responses.
-   *
-   * <p>If unset, the {@link ResponseCache#getDefault() system-wide default}
-   * response cache will be used.
-   *
-   * @deprecated OkHttp 2 dropped support for java.net.ResponseCache. That API
-   *     is broken for many reasons: URI instead of URL, no conditional updates,
-   *     no invalidation, and no mechanism for tracking hit rates. Use
-   *     {@link #setOkResponseCache} instead.
    */
-  @Deprecated
   public OkHttpClient setResponseCache(ResponseCache responseCache) {
-    if (responseCache instanceof OkResponseCache) {
-      return setOkResponseCache((OkResponseCache) responseCache);
-    }
-    throw new UnsupportedOperationException("OkHttp 2 dropped support for java.net.ResponseCache. "
-        + "Use setOkResponseCache() instead.");
+    return setOkResponseCache(toOkResponseCache(responseCache));
   }
 
-  /**
-   * @deprecated OkHttp 2 dropped support for java.net.ResponseCache. That API
-   *     is broken for many reasons: URI instead of URL, no conditional updates,
-   *     no invalidation, and no mechanism for tracking hit rates. Use
-   *     {@link #setOkResponseCache} instead.
-   */
-  @Deprecated
   public ResponseCache getResponseCache() {
-    throw new UnsupportedOperationException("OkHttp 2 dropped support for java.net.ResponseCache. "
-        + "Use setOkResponseCache() instead.");
+    return responseCache instanceof ResponseCacheAdapter
+        ? ((ResponseCacheAdapter) responseCache).getDelegate()
+        : null;
   }
 
   public OkHttpClient setOkResponseCache(OkResponseCache responseCache) {
@@ -202,8 +195,7 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
   /**
    * Sets the socket factory used to secure HTTPS connections.
    *
-   * <p>If unset, the {@link HttpsURLConnection#getDefaultSSLSocketFactory()
-   * system-wide default} SSL socket factory will be used.
+   * <p>If unset, a lazily created SSL socket factory will be used.
    */
   public OkHttpClient setSslSocketFactory(SSLSocketFactory sslSocketFactory) {
     this.sslSocketFactory = sslSocketFactory;
@@ -218,7 +210,8 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
    * Sets the verifier used to confirm that response certificates apply to
    * requested hostnames for HTTPS connections.
    *
-   * <p>If unset, the {@link HttpsURLConnection#getDefaultHostnameVerifier()
+   * <p>If unset, the
+   * {@link javax.net.ssl.HttpsURLConnection#getDefaultHostnameVerifier()
    * system-wide default} hostname verifier will be used.
    */
   public OkHttpClient setHostnameVerifier(HostnameVerifier hostnameVerifier) {
@@ -296,8 +289,9 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
   }
 
   /**
-   * @deprecated OkHttp 2 enforces an enumeration of {@link Protocol protocols}
-   * that can be selected. Please switch to {@link #setProtocols(java.util.List)}.
+   * @deprecated OkHttp 1.5 enforces an enumeration of {@link Protocol
+   *     protocols} that can be selected. Please switch to {@link
+   *     #setProtocols(java.util.List)}.
    */
   @Deprecated
   public OkHttpClient setTransports(List<String> transports) {
@@ -323,12 +317,12 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
    * <p>The following protocols are currently supported:
    * <ul>
    *   <li><a href="http://www.w3.org/Protocols/rfc2616/rfc2616.html">http/1.1</a>
-   *   <li><a href="http://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3">spdy/3</a>
+   *   <li><a href="http://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3-1">spdy/3.1</a>
    *   <li><a href="http://tools.ietf.org/html/draft-ietf-httpbis-http2-09">HTTP-draft-09/2.0</a>
    * </ul>
    *
    * <p><strong>This is an evolving set.</strong> Future releases may drop
-   * support for transitional protocols (like spdy/3), in favor of their
+   * support for transitional protocols (like spdy/3.1), in favor of their
    * successors (spdy/4 or http/2.0). The http/1.1 transport will never be
    * dropped.
    *
@@ -349,16 +343,14 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
     if (protocols.contains(null)) {
       throw new IllegalArgumentException("protocols must not contain null");
     }
-    if (protocols.contains(ByteString.EMPTY)) {
-      throw new IllegalArgumentException("protocols contains an empty string");
-    }
     this.protocols = Util.immutableList(protocols);
     return this;
   }
 
   /**
-   * @deprecated OkHttp 2 enforces an enumeration of {@link Protocol protocols}
-   * that can be selected. Please switch to {@link #getProtocols()}.
+   * @deprecated OkHttp 1.5 enforces an enumeration of {@link Protocol
+   *     protocols} that can be selected. Please switch to {@link
+   *     #getProtocols()}.
    */
   @Deprecated
   public List<String> getTransports() {
@@ -371,6 +363,46 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
 
   public List<Protocol> getProtocols() {
     return protocols;
+  }
+
+  /**
+   * Invokes {@code request} immediately, and blocks until the response can be
+   * processed or is in error.
+   *
+   * <p>The caller may read the response body with the response's
+   * {@link Response#body} method.  To facilitate connection recycling, callers
+   * should always {@link Response.Body#close() close the response body}.
+   *
+   * <p>Note that transport-layer success (receiving a HTTP response code,
+   * headers and body) does not necessarily indicate application-layer
+   * success: {@code response} may still indicate an unhappy HTTP response
+   * code like 404 or 500.
+   *
+   * <h3>Non-blocking responses</h3>
+   *
+   * <p>Receivers do not need to block while waiting for the response body to
+   * download. Instead, they can get called back as data arrives. Use {@link
+   * Response.Body#ready} to check if bytes should be read immediately. While
+   * there is data ready, read it.
+   *
+   * <p>The current implementation of {@link Response.Body#ready} always
+   * returns true when the underlying transport is HTTP/1. This results in
+   * blocking on that transport. For effective non-blocking your server must
+   * support {@link Protocol#SPDY_3} or {@link Protocol#HTTP_2}.
+   *
+   * @throws IOException when the request could not be executed due to a
+   * connectivity problem or timeout. Because networks can fail during an
+   * exchange, it is possible that the remote server accepted the request
+   * before the failure.
+   */
+  public Response execute(Request request) throws IOException {
+    // Copy the client. Otherwise changes (socket factory, redirect policy,
+    // etc.) may incorrectly be reflected in the request when it is executed.
+    OkHttpClient client = copyWithDefaults();
+    Job job = new Job(dispatcher, client, request, null);
+    Response result = job.getResponse(); // Since we don't cancel, this won't be null.
+    job.engine.releaseConnection(); // Transfer ownership of the body to the caller.
+    return result;
   }
 
   /**
@@ -422,10 +454,10 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
       result.cookieHandler = CookieHandler.getDefault();
     }
     if (result.responseCache == null) {
-      result.responseCache = toOkResponseCacheOrNull(ResponseCache.getDefault());
+      result.responseCache = toOkResponseCache(ResponseCache.getDefault());
     }
     if (result.sslSocketFactory == null) {
-      result.sslSocketFactory = HttpsURLConnection.getDefaultSSLSocketFactory();
+      result.sslSocketFactory = getDefaultSSLSocketFactory();
     }
     if (result.hostnameVerifier == null) {
       result.hostnameVerifier = OkHostnameVerifier.INSTANCE;
@@ -442,6 +474,30 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
     return result;
   }
 
+  /**
+   * Java and Android programs default to using a single global SSL context,
+   * accessible to HTTP clients as {@link SSLSocketFactory#getDefault()}. If we
+   * used the shared SSL context, when OkHttp enables NPN for its SPDY-related
+   * stuff, it would also enable NPN for other usages, which might crash them
+   * because NPN is enabled when it isn't expected to be.
+   * <p>
+   * This code avoids that by defaulting to an OkHttp created SSL context. The
+   * significant drawback of this approach is that apps that customize the
+   * global SSL context will lose these customizations.
+   */
+  private synchronized SSLSocketFactory getDefaultSSLSocketFactory() {
+    if (sslSocketFactory == null) {
+      try {
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(null, null, null);
+        sslSocketFactory = sslContext.getSocketFactory();
+      } catch (GeneralSecurityException e) {
+        throw new AssertionError(); // The system has no TLS. Just give up.
+      }
+    }
+    return sslSocketFactory;
+  }
+
   /** Returns a shallow copy of this OkHttpClient. */
   @Override public OkHttpClient clone() {
     try {
@@ -451,8 +507,10 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
     }
   }
 
-  private OkResponseCache toOkResponseCacheOrNull(ResponseCache cache) {
-    return cache instanceof OkResponseCache ? ((OkResponseCache) cache) : null;
+  private OkResponseCache toOkResponseCache(ResponseCache responseCache) {
+    return responseCache == null || responseCache instanceof OkResponseCache
+        ? (OkResponseCache) responseCache
+        : new ResponseCacheAdapter(responseCache);
   }
 
   /**

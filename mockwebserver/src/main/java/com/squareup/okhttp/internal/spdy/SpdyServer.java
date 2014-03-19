@@ -18,19 +18,19 @@ package com.squareup.okhttp.internal.spdy;
 
 import com.squareup.okhttp.Protocol;
 import com.squareup.okhttp.internal.SslContextBuilder;
+import com.squareup.okhttp.internal.Util;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Arrays;
 import java.util.List;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
+import okio.BufferedSink;
+import okio.Okio;
 import org.eclipse.jetty.npn.NextProtoNego;
 
 import static com.squareup.okhttp.internal.Util.headerEntries;
@@ -110,9 +110,8 @@ public final class SpdyServer implements IncomingStreamHandler {
     List<Header> responseHeaders =
         headerEntries(":status", "404", ":version", "HTTP/1.1", "content-type", "text/plain");
     stream.reply(responseHeaders, true);
-    OutputStream out = stream.getOutputStream();
-    String text = "Not found: " + path;
-    out.write(text.getBytes("UTF-8"));
+    BufferedSink out = Okio.buffer(stream.getSink());
+    out.writeUtf8("Not found: " + path);
     out.close();
   }
 
@@ -121,26 +120,29 @@ public final class SpdyServer implements IncomingStreamHandler {
         headerEntries(":status", "200", ":version", "HTTP/1.1", "content-type",
             "text/html; charset=UTF-8");
     stream.reply(responseHeaders, true);
-    OutputStream out = stream.getOutputStream();
-    Writer writer = new OutputStreamWriter(out, "UTF-8");
+    BufferedSink out = Okio.buffer(stream.getSink());
     for (String file : files) {
-      writer.write("<a href='" + file + "'>" + file + "</a><br>");
+      out.writeUtf8("<a href='" + file + "'>" + file + "</a><br>");
     }
-    writer.close();
+    out.close();
   }
 
   private void serveFile(SpdyStream stream, File file) throws IOException {
-    InputStream in = new FileInputStream(file);
     byte[] buffer = new byte[8192];
     stream.reply(
         headerEntries(":status", "200", ":version", "HTTP/1.1", "content-type", contentType(file)),
         true);
-    OutputStream out = stream.getOutputStream();
-    int count;
-    while ((count = in.read(buffer)) != -1) {
-      out.write(buffer, 0, count);
+    InputStream in = new FileInputStream(file);
+    BufferedSink out = Okio.buffer(stream.getSink());
+    try {
+      int count;
+      while ((count = in.read(buffer)) != -1) {
+        out.write(buffer, 0, count);
+      }
+    } finally {
+      Util.closeQuietly(in);
+      Util.closeQuietly(out);
     }
-    out.close();
   }
 
   private String contentType(File file) {

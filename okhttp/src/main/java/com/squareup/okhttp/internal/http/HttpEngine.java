@@ -30,7 +30,6 @@ import com.squareup.okhttp.TunnelRequest;
 import com.squareup.okhttp.internal.Dns;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.CacheRequest;
 import java.net.CookieHandler;
 import java.net.ProtocolException;
@@ -39,10 +38,14 @@ import java.net.UnknownHostException;
 import java.security.cert.CertificateException;
 import java.util.List;
 import java.util.Map;
-import java.util.zip.GZIPInputStream;
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLSocketFactory;
+import okio.BufferedSink;
+import okio.GzipSource;
+import okio.Okio;
+import okio.Sink;
+import okio.Source;
 
 import static com.squareup.okhttp.internal.Util.closeQuietly;
 import static com.squareup.okhttp.internal.Util.getDefaultPort;
@@ -68,11 +71,6 @@ import static java.net.HttpURLConnection.HTTP_NO_CONTENT;
  *
  * <p>The request and response may be served by the HTTP response cache, by the
  * network, or by both in the event of a conditional GET.
- *
- * <p>This class may hold a socket connection that needs to be released or
- * recycled. By default, this socket connection is held when the last byte of
- * the response is consumed. To release the connection when it is no longer
- * required, use {@link #automaticallyReleaseConnectionToPool()}.
  */
 public class HttpEngine {
   final OkHttpClient client;
@@ -100,15 +98,18 @@ public class HttpEngine {
    */
   public final boolean bufferRequestBody;
 
+  private Request originalRequest;
   private Request request;
-  private OutputStream requestBodyOut;
+  private Sink requestBodyOut;
+  private BufferedSink bufferedRequestBody;
 
   private ResponseSource responseSource;
 
   /** Null until a response is received from the network or the cache. */
   private Response response;
-  private InputStream responseTransferIn;
-  private InputStream responseBodyIn;
+  private Source responseTransferSource;
+  private Source responseBody;
+  private InputStream responseBodyBytes;
 
   /**
    * The cache response currently being validated on a conditional get. Null
@@ -122,15 +123,6 @@ public class HttpEngine {
   private CacheRequest cacheRequest;
 
   /**
-   * True if the socket connection should be released to the connection pool
-   * when the response has been fully read.
-   */
-  private boolean automaticallyReleaseConnectionToPool;
-
-  /** True if the socket connection is no longer needed by this engine. */
-  private boolean connectionReleased;
-
-  /**
    * @param request the HTTP request without a body. The body must be
    *     written via the engine's request body stream.
    * @param connection the connection used for an intermediate response
@@ -142,8 +134,9 @@ public class HttpEngine {
    *     recover from a failure.
    */
   public HttpEngine(OkHttpClient client, Request request, boolean bufferRequestBody,
-      Connection connection, RouteSelector routeSelector, RetryableOutputStream requestBodyOut) {
+      Connection connection, RouteSelector routeSelector, RetryableSink requestBodyOut) {
     this.client = client;
+    this.originalRequest = request;
     this.request = request;
     this.bufferRequestBody = bufferRequestBody;
     this.connection = connection;
@@ -199,15 +192,16 @@ public class HttpEngine {
       }
 
     } else {
-      // We're using a cached response. Close the connection we may have inherited from a redirect.
+      // We're using a cached response. Recycle a connection we may have inherited from a redirect.
       if (connection != null) {
-        disconnect();
+        client.getConnectionPool().recycle(connection);
+        connection = null;
       }
 
       // No need for the network! Promote the cached response immediately.
       this.response = validatingResponse;
       if (validatingResponse.body() != null) {
-        initContentStream(validatingResponse.body().byteStream());
+        initContentStream(validatingResponse.body().source());
       }
     }
   }
@@ -243,22 +237,13 @@ public class HttpEngine {
 
     if (!connection.isConnected()) {
       connection.connect(client.getConnectTimeout(), client.getReadTimeout(), getTunnelConfig());
-      client.getConnectionPool().maybeShare(connection);
+      if (connection.isSpdy()) client.getConnectionPool().share(connection);
       client.getRoutesDatabase().connected(connection.getRoute());
     } else if (!connection.isSpdy()) {
       connection.updateReadTimeout(client.getReadTimeout());
     }
 
     route = connection.getRoute();
-  }
-
-  /**
-   * Recycle the connection to the origin server. It is an error to call this
-   * with a request in flight.
-   */
-  private void disconnect() {
-    client.getConnectionPool().recycle(connection);
-    connection = null;
   }
 
   /**
@@ -271,18 +256,30 @@ public class HttpEngine {
   }
 
   boolean hasRequestBody() {
-    String method = request.method();
-    return method.equals("POST") || method.equals("PUT") || method.equals("PATCH");
+    return HttpMethod.hasRequestBody(request.method());
   }
 
   /** Returns the request body or null if this request doesn't have a body. */
-  public final OutputStream getRequestBody() {
+  public final Sink getRequestBody() {
     if (responseSource == null) throw new IllegalStateException();
     return requestBodyOut;
   }
 
+  public final BufferedSink getBufferedRequestBody() {
+    BufferedSink result = bufferedRequestBody;
+    if (result != null) return result;
+    Sink requestBody = getRequestBody();
+    return requestBody != null
+        ? (bufferedRequestBody = Okio.buffer(requestBody))
+        : null;
+  }
+
   public final boolean hasResponse() {
     return response != null;
+  }
+
+  public final ResponseSource responseSource() {
+    return responseSource;
   }
 
   public final Request getRequest() {
@@ -296,9 +293,16 @@ public class HttpEngine {
     return response;
   }
 
-  public final InputStream getResponseBody() {
+  public final Source getResponseBody() {
     if (response == null) throw new IllegalStateException();
-    return responseBodyIn;
+    return responseBody;
+  }
+
+  public final InputStream getResponseBodyBytes() {
+    InputStream result = responseBodyBytes;
+    return result != null
+        ? result
+        : (responseBodyBytes = Okio.buffer(getResponseBody()).inputStream());
   }
 
   public final Connection getConnection() {
@@ -315,8 +319,7 @@ public class HttpEngine {
       routeSelector.connectFailed(connection, e);
     }
 
-    boolean canRetryRequestBody = requestBodyOut == null
-        || requestBodyOut instanceof RetryableOutputStream;
+    boolean canRetryRequestBody = requestBodyOut == null || requestBodyOut instanceof RetryableSink;
     if (routeSelector == null && connection == null // No connection.
         || routeSelector != null && !routeSelector.hasNext() // No more routes to attempt.
         || !isRecoverable(e)
@@ -324,11 +327,11 @@ public class HttpEngine {
       return null;
     }
 
-    release(true);
+    Connection connection = close();
 
     // For failure recovery, use the same route selector with a new connection.
-    return new HttpEngine(client, request, bufferRequestBody, null, routeSelector,
-        (RetryableOutputStream) requestBodyOut);
+    return new HttpEngine(client, originalRequest, bufferRequestBody, connection, routeSelector,
+        (RetryableSink) requestBodyOut);
   }
 
   private boolean isRecoverable(IOException e) {
@@ -363,48 +366,58 @@ public class HttpEngine {
   }
 
   /**
-   * Cause the socket connection to be released to the connection pool when
-   * it is no longer needed. If it is already unneeded, it will be pooled
-   * immediately. Otherwise the connection is held so that redirects can be
-   * handled by the same connection.
+   * Configure the socket connection to be either pooled or closed when it is
+   * either exhausted or closed. If it is unneeded when this is called, it will
+   * be released immediately.
    */
-  public final void automaticallyReleaseConnectionToPool() {
-    automaticallyReleaseConnectionToPool = true;
-    if (connection != null && connectionReleased) {
-      disconnect();
+  public final void releaseConnection() throws IOException {
+    if (transport != null && connection != null) {
+      transport.releaseConnectionOnIdle();
     }
+    connection = null;
   }
 
   /**
-   * Releases this engine so that its resources may be either reused or
-   * closed. Also call {@link #automaticallyReleaseConnectionToPool} unless
-   * the connection will be used to follow a redirect.
+   * Release any resources held by this engine. If a connection is still held by
+   * this engine, it is returned.
    */
-  public final void release(boolean streamCanceled) {
-    // If the response body comes from the cache, close it.
-    if (validatingResponse != null
-        && validatingResponse.body() != null
-        && responseBodyIn == validatingResponse.body().byteStream()) {
-      closeQuietly(responseBodyIn);
+  public final Connection close() {
+    if (bufferedRequestBody != null) {
+      // This also closes the wrapped requestBodyOut.
+      closeQuietly(bufferedRequestBody);
+    } else if (requestBodyOut != null) {
+      closeQuietly(requestBodyOut);
     }
 
-    if (connection != null && !connectionReleased) {
-      connectionReleased = true;
-
-      if (transport == null
-          || !transport.makeReusable(streamCanceled, requestBodyOut, responseTransferIn)) {
-        closeQuietly(connection);
-        connection = null;
-      } else if (automaticallyReleaseConnectionToPool) {
-        disconnect();
-      }
+    // If this engine never achieved a response body, its connection cannot be reused.
+    if (responseBody == null) {
+      closeQuietly(connection);
+      connection = null;
+      return null;
     }
+
+    // Close the response body. This will recycle the connection if it is eligible.
+    closeQuietly(responseBody);
+
+    // Clear the buffer held by the response body input stream adapter.
+    closeQuietly(responseBodyBytes);
+
+    // Close the connection if it cannot be reused.
+    if (transport != null && !transport.canReuseConnection()) {
+      closeQuietly(connection);
+      connection = null;
+      return null;
+    }
+
+    Connection result = connection;
+    connection = null;
+    return result;
   }
 
   /**
-   * Initialize the response content stream from the response transfer stream.
-   * These two streams are the same unless we're doing transparent gzip, in
-   * which case the content stream is decompressed.
+   * Initialize the response content stream from the response transfer source.
+   * These two sources are the same unless we're doing transparent gzip, in
+   * which case the content source is decompressed.
    *
    * <p>Whenever we do transparent gzip we also strip the corresponding headers.
    * We strip the Content-Encoding header to prevent the application from
@@ -415,18 +428,18 @@ public class HttpEngine {
    * <p>This method should only be used for non-empty response bodies. Response
    * codes like "304 Not Modified" can include "Content-Encoding: gzip" without
    * a response body and we will crash if we attempt to decompress the zero-byte
-   * stream.
+   * source.
    */
-  private void initContentStream(InputStream transferStream) throws IOException {
-    responseTransferIn = transferStream;
+  private void initContentStream(Source transferSource) throws IOException {
+    responseTransferSource = transferSource;
     if (transparentGzip && "gzip".equalsIgnoreCase(response.header("Content-Encoding"))) {
       response = response.newBuilder()
           .removeHeader("Content-Encoding")
           .removeHeader("Content-Length")
           .build();
-      responseBodyIn = new GZIPInputStream(transferStream);
+      responseBody = new GzipSource(transferSource);
     } else {
-      responseBodyIn = transferStream;
+      responseBody = transferSource;
     }
   }
 
@@ -491,8 +504,14 @@ public class HttpEngine {
 
     CookieHandler cookieHandler = client.getCookieHandler();
     if (cookieHandler != null) {
-      Map<String, List<String>> cookies = cookieHandler.get(
-          request.uri(), OkHeaders.toMultimap(request.getHeaders(), null));
+      // Capture the request headers added so far so that they can be offered to the CookieHandler.
+      // This is mostly to stay close to the RI; it is unlikely any of the headers above would
+      // affect cookie choice besides "Host".
+      Map<String, List<String>> headers = OkHeaders.toMultimap(result.build().headers(), null);
+
+      Map<String, List<String>> cookies = cookieHandler.get(request.uri(), headers);
+
+      // Add any new cookies to the request.
       OkHeaders.addCookies(result, cookies);
     }
 
@@ -519,11 +538,15 @@ public class HttpEngine {
     if (responseSource == null) throw new IllegalStateException("call sendRequest() first!");
     if (!responseSource.requiresConnection()) return;
 
+    // Flush the request body if there's data outstanding.
+    if (bufferedRequestBody != null && bufferedRequestBody.buffer().size() > 0) {
+      bufferedRequestBody.flush();
+    }
+
     if (sentRequestMillis == -1) {
-      if (OkHeaders.contentLength(request) == -1
-          && requestBodyOut instanceof RetryableOutputStream) {
+      if (OkHeaders.contentLength(request) == -1 && requestBodyOut instanceof RetryableSink) {
         // We might not learn the Content-Length until the request body has been buffered.
-        long contentLength = ((RetryableOutputStream) requestBodyOut).contentLength();
+        long contentLength = ((RetryableSink) requestBodyOut).contentLength();
         request = request.newBuilder()
             .header("Content-Length", Long.toString(contentLength))
             .build();
@@ -532,9 +555,14 @@ public class HttpEngine {
     }
 
     if (requestBodyOut != null) {
-      requestBodyOut.close();
-      if (requestBodyOut instanceof RetryableOutputStream) {
-        transport.writeRequestBody((RetryableOutputStream) requestBodyOut);
+      if (bufferedRequestBody != null) {
+        // This also closes the wrapped requestBodyOut.
+        bufferedRequestBody.close();
+      } else {
+        requestBodyOut.close();
+      }
+      if (requestBodyOut instanceof RetryableSink) {
+        transport.writeRequestBody((RetryableSink) requestBodyOut);
       }
     }
 
@@ -552,7 +580,8 @@ public class HttpEngine {
 
     if (responseSource == ResponseSource.CONDITIONAL_CACHE) {
       if (validatingResponse.validate(response)) {
-        release(false);
+        transport.emptyTransferStream();
+        releaseConnection();
         response = combine(validatingResponse, response);
 
         // Update the cache after combining headers but before stripping the
@@ -562,7 +591,7 @@ public class HttpEngine {
         responseCache.update(validatingResponse, cacheableResponse());
 
         if (validatingResponse.body() != null) {
-          initContentStream(validatingResponse.body().byteStream());
+          initContentStream(validatingResponse.body().source());
         }
         return;
       } else {
@@ -572,8 +601,8 @@ public class HttpEngine {
 
     if (!hasResponseBody()) {
       // Don't call initContentStream() when the response doesn't have any content.
-      responseTransferIn = transport.getTransferStream(cacheRequest);
-      responseBodyIn = responseTransferIn;
+      responseTransferSource = transport.getTransferStream(cacheRequest);
+      responseBody = responseTransferSource;
       return;
     }
 

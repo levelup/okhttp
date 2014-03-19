@@ -16,10 +16,9 @@
 
 package com.squareup.okhttp;
 
-import com.squareup.okhttp.internal.Base64;
 import com.squareup.okhttp.internal.DiskLruCache;
-import com.squareup.okhttp.internal.StrictLineReader;
 import com.squareup.okhttp.internal.Util;
+import com.squareup.okhttp.internal.http.HttpMethod;
 import java.io.BufferedWriter;
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -43,8 +42,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import okio.BufferedSource;
+import okio.ByteString;
+import okio.Okio;
 
-import static com.squareup.okhttp.internal.Util.US_ASCII;
 import static com.squareup.okhttp.internal.Util.UTF_8;
 
 /**
@@ -195,8 +196,7 @@ public final class HttpResponseCache extends ResponseCache implements OkResponse
   }
 
   @Override public boolean maybeRemove(Request request) {
-    String method = request.method();
-    if (method.equals("POST") || method.equals("PUT") || method.equals("DELETE")) {
+    if (HttpMethod.invalidatesCache(request.method())) {
       try {
         cache.remove(urlToKey(request));
       } catch (IOException ignored) {
@@ -412,32 +412,32 @@ public final class HttpResponseCache extends ResponseCache implements OkResponse
      */
     public Entry(InputStream in) throws IOException {
       try {
-        StrictLineReader reader = new StrictLineReader(in, US_ASCII);
-        url = reader.readLine();
-        requestMethod = reader.readLine();
+        BufferedSource source = Okio.buffer(Okio.source(in));
+        url = source.readUtf8LineStrict();
+        requestMethod = source.readUtf8LineStrict();
         Headers.Builder varyHeadersBuilder = new Headers.Builder();
-        int varyRequestHeaderLineCount = reader.readInt();
+        int varyRequestHeaderLineCount = readInt(source);
         for (int i = 0; i < varyRequestHeaderLineCount; i++) {
-          varyHeadersBuilder.addLine(reader.readLine());
+          varyHeadersBuilder.addLine(source.readUtf8LineStrict());
         }
         varyHeaders = varyHeadersBuilder.build();
 
-        statusLine = reader.readLine();
+        statusLine = source.readUtf8LineStrict();
         Headers.Builder responseHeadersBuilder = new Headers.Builder();
-        int responseHeaderLineCount = reader.readInt();
+        int responseHeaderLineCount = readInt(source);
         for (int i = 0; i < responseHeaderLineCount; i++) {
-          responseHeadersBuilder.addLine(reader.readLine());
+          responseHeadersBuilder.addLine(source.readUtf8LineStrict());
         }
         responseHeaders = responseHeadersBuilder.build();
 
         if (isHttps()) {
-          String blank = reader.readLine();
+          String blank = source.readUtf8LineStrict();
           if (blank.length() > 0) {
             throw new IOException("expected \"\" but was \"" + blank + "\"");
           }
-          String cipherSuite = reader.readLine();
-          List<Certificate> peerCertificates = readCertificateList(reader);
-          List<Certificate> localCertificates = readCertificateList(reader);
+          String cipherSuite = source.readUtf8LineStrict();
+          List<Certificate> peerCertificates = readCertificateList(source);
+          List<Certificate> localCertificates = readCertificateList(source);
           handshake = Handshake.get(cipherSuite, peerCertificates, localCertificates);
         } else {
           handshake = null;
@@ -486,16 +486,16 @@ public final class HttpResponseCache extends ResponseCache implements OkResponse
       return url.startsWith("https://");
     }
 
-    private List<Certificate> readCertificateList(StrictLineReader reader) throws IOException {
-      int length = reader.readInt();
+    private List<Certificate> readCertificateList(BufferedSource source) throws IOException {
+      int length = readInt(source);
       if (length == -1) return Collections.emptyList(); // OkHttp v1.2 used -1 to indicate null.
 
       try {
         CertificateFactory certificateFactory = CertificateFactory.getInstance("X.509");
         List<Certificate> result = new ArrayList<Certificate>(length);
         for (int i = 0; i < length; i++) {
-          String line = reader.readLine();
-          byte[] bytes = Base64.decode(line.getBytes("US-ASCII"));
+          String line = source.readUtf8LineStrict();
+          byte[] bytes = ByteString.decodeBase64(line).toByteArray();
           result.add(certificateFactory.generateCertificate(new ByteArrayInputStream(bytes)));
         }
         return result;
@@ -509,7 +509,7 @@ public final class HttpResponseCache extends ResponseCache implements OkResponse
         writer.write(Integer.toString(certificates.size()) + '\n');
         for (int i = 0, size = certificates.size(); i < size; i++) {
           byte[] bytes = certificates.get(i).getEncoded();
-          String line = Base64.encode(bytes);
+          String line = ByteString.of(bytes).base64();
           writer.write(line + '\n');
         }
       } catch (CertificateEncodingException e) {
@@ -533,6 +533,15 @@ public final class HttpResponseCache extends ResponseCache implements OkResponse
           .body(new CacheResponseBody(snapshot, contentType, contentLength))
           .handshake(handshake)
           .build();
+    }
+  }
+
+  private static int readInt(BufferedSource source) throws IOException {
+    String line = source.readUtf8LineStrict();
+    try {
+      return Integer.parseInt(line);
+    } catch (NumberFormatException e) {
+      throw new IOException("Expected an integer but was \"" + line + "\"");
     }
   }
 

@@ -18,10 +18,10 @@
 package com.squareup.okhttp.mockwebserver;
 
 import com.squareup.okhttp.Protocol;
-import com.squareup.okhttp.internal.ByteString;
 import com.squareup.okhttp.internal.NamedRunnable;
 import com.squareup.okhttp.internal.Platform;
 import com.squareup.okhttp.internal.Util;
+import com.squareup.okhttp.internal.spdy.ErrorCode;
 import com.squareup.okhttp.internal.spdy.Header;
 import com.squareup.okhttp.internal.spdy.IncomingStreamHandler;
 import com.squareup.okhttp.internal.spdy.SpdyConnection;
@@ -63,6 +63,10 @@ import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
+import okio.BufferedSink;
+import okio.ByteString;
+import okio.OkBuffer;
+import okio.Okio;
 
 import static com.squareup.okhttp.mockwebserver.SocketPolicy.DISCONNECT_AT_START;
 import static com.squareup.okhttp.mockwebserver.SocketPolicy.FAIL_HANDSHAKE;
@@ -72,7 +76,6 @@ import static com.squareup.okhttp.mockwebserver.SocketPolicy.FAIL_HANDSHAKE;
  * replays them upon request in sequence.
  */
 public final class MockWebServer {
-
   private static final X509TrustManager UNTRUSTED_TRUST_MANAGER = new X509TrustManager() {
     @Override public void checkClientTrusted(X509Certificate[] chain, String authType)
         throws CertificateException {
@@ -107,6 +110,7 @@ public final class MockWebServer {
 
   private int port = -1;
   private boolean npnEnabled = true;
+  private List<Protocol> npnProtocols = Protocol.HTTP2_SPDY3_AND_HTTP;
 
   public int getPort() {
     if (port == -1) throw new IllegalStateException("Cannot retrieve port before calling play()");
@@ -164,6 +168,24 @@ public final class MockWebServer {
    */
   public void setNpnEnabled(boolean npnEnabled) {
     this.npnEnabled = npnEnabled;
+  }
+
+  /**
+   * Indicates the protocols supported by NPN on incoming HTTPS connections.
+   * This list is ignored when npn is disabled.
+   *
+   * @param protocols the protocols to use, in order of preference. The list
+   *     must contain "http/1.1". It must not contain null.
+   */
+  public void setNpnProtocols(List<Protocol> protocols) {
+    protocols = Util.immutableList(protocols);
+    if (!protocols.contains(Protocol.HTTP_11)) {
+      throw new IllegalArgumentException("protocols doesn't contain http/1.1: " + protocols);
+    }
+    if (protocols.contains(null)) {
+      throw new IllegalArgumentException("protocols must not contain null");
+    }
+    this.npnProtocols = Util.immutableList(protocols);
   }
 
   /**
@@ -305,8 +327,7 @@ public final class MockWebServer {
           openClientSockets.put(socket, true);
 
           if (npnEnabled) {
-            // TODO: expose means to select which protocols to advertise.
-            Platform.get().setNpnProtocols(sslSocket, Protocol.HTTP2_SPDY3_AND_HTTP);
+            Platform.get().setNpnProtocols(sslSocket, npnProtocols);
           }
 
           sslSocket.startHandshake();
@@ -327,7 +348,6 @@ public final class MockWebServer {
               .handler(spdySocketHandler).build();
           openSpdyConnections.put(spdyConnection, Boolean.TRUE);
           openClientSockets.remove(socket);
-          spdyConnection.readConnectionHeader();
           return;
         }
 
@@ -381,7 +401,9 @@ public final class MockWebServer {
         } else if (response.getSocketPolicy() == SocketPolicy.SHUTDOWN_OUTPUT_AT_END) {
           socket.shutdownOutput();
         }
-        logger.info("Received request: " + request + " and responded: " + response);
+        if (logger.isLoggable(Level.INFO)) {
+          logger.info("Received request: " + request + " and responded: " + response);
+        }
         sequenceNumber++;
         return true;
       }
@@ -473,7 +495,6 @@ public final class MockWebServer {
     if (request.startsWith("OPTIONS ")
         || request.startsWith("GET ")
         || request.startsWith("HEAD ")
-        || request.startsWith("DELETE ")
         || request.startsWith("TRACE ")
         || request.startsWith("CONNECT ")) {
       if (hasBody) {
@@ -481,7 +502,8 @@ public final class MockWebServer {
       }
     } else if (!request.startsWith("POST ")
         && !request.startsWith("PUT ")
-        && !request.startsWith("PATCH ")) {
+        && !request.startsWith("PATCH ")
+        && !request.startsWith("DELETE ")) { // Permitted as spec is ambiguous.
       throw new UnsupportedOperationException("Unexpected method: " + request);
     }
 
@@ -611,8 +633,10 @@ public final class MockWebServer {
         throw new AssertionError(e);
       }
       writeResponse(stream, response);
-      logger.info("Received request: " + request + " and responded: " + response
-          + " protocol is " + protocol.name.utf8());
+      if (logger.isLoggable(Level.INFO)) {
+        logger.info("Received request: " + request + " and responded: " + response
+            + " protocol is " + protocol.name.utf8());
+      }
     }
 
     private RecordedRequest readRequest(SpdyStream stream) throws IOException {
@@ -635,7 +659,7 @@ public final class MockWebServer {
         }
       }
 
-      InputStream bodyIn = stream.getInputStream();
+      InputStream bodyIn = Okio.buffer(stream.getSource()).inputStream();
       ByteArrayOutputStream bodyOut = new ByteArrayOutputStream();
       byte[] buffer = new byte[8192];
       int count;
@@ -672,9 +696,14 @@ public final class MockWebServer {
         }
         spdyHeaders.add(new Header(headerParts[0], headerParts[1]));
       }
-      byte[] body = response.getBody();
-      stream.reply(spdyHeaders, body.length > 0);
-      if (body.length > 0) {
+      OkBuffer body = new OkBuffer();
+      if (response.getBody() != null) {
+        body.write(response.getBody());
+      }
+      boolean closeStreamAfterHeaders = body.size() > 0 || !response.getPushPromises().isEmpty();
+      stream.reply(spdyHeaders, closeStreamAfterHeaders);
+      pushPromises(stream, response.getPushPromises());
+      if (body.size() > 0) {
         if (response.getBodyDelayTimeMs() != 0) {
           try {
             Thread.sleep(response.getBodyDelayTimeMs());
@@ -682,8 +711,53 @@ public final class MockWebServer {
             throw new AssertionError(e);
           }
         }
-        stream.getOutputStream().write(body);
-        stream.getOutputStream().close();
+        BufferedSink sink = Okio.buffer(stream.getSink());
+        if (response.getThrottleBytesPerPeriod() == Integer.MAX_VALUE) {
+          sink.write(body, body.size());
+          sink.flush();
+        } else {
+          while (body.size() > 0) {
+            long toWrite = Math.min(body.size(), response.getThrottleBytesPerPeriod());
+            sink.write(body, toWrite);
+            sink.flush();
+            try {
+              long delayMs = response.getThrottleUnit().toMillis(response.getThrottlePeriod());
+              if (delayMs != 0) Thread.sleep(delayMs);
+            } catch (InterruptedException e) {
+              throw new AssertionError();
+            }
+          }
+        }
+        sink.close();
+      } else if (closeStreamAfterHeaders) {
+        stream.close(ErrorCode.NO_ERROR);
+      }
+    }
+
+    private void pushPromises(SpdyStream stream, List<PushPromise> promises) throws IOException {
+      for (PushPromise pushPromise : promises) {
+        List<Header> pushedHeaders = new ArrayList<Header>();
+        pushedHeaders.add(new Header(stream.getConnection().getProtocol() == Protocol.SPDY_3
+            ? Header.TARGET_HOST
+            : Header.TARGET_AUTHORITY, getUrl(pushPromise.getPath()).getHost()));
+        pushedHeaders.add(new Header(Header.TARGET_METHOD, pushPromise.getMethod()));
+        pushedHeaders.add(new Header(Header.TARGET_PATH, pushPromise.getPath()));
+        for (int i = 0, size = pushPromise.getHeaders().size(); i < size; i++) {
+          String header = pushPromise.getHeaders().get(i);
+          String[] headerParts = header.split(":", 2);
+          if (headerParts.length != 2) {
+            throw new AssertionError("Unexpected header: " + header);
+          }
+          pushedHeaders.add(new Header(headerParts[0], headerParts[1].trim()));
+        }
+        String requestLine = pushPromise.getMethod() + ' ' + pushPromise.getPath() + " HTTP/1.1";
+        List<Integer> chunkSizes = Collections.emptyList(); // No chunked encoding for SPDY.
+        requestQueue.add(new RecordedRequest(requestLine, pushPromise.getHeaders(), chunkSizes, 0,
+            Util.EMPTY_BYTE_ARRAY, sequenceNumber.getAndIncrement(), socket));
+        byte[] pushedBody = pushPromise.getResponse().getBody();
+        SpdyStream pushedStream =
+            stream.getConnection().pushStream(stream.getId(), pushedHeaders, pushedBody.length > 0);
+        writeResponse(pushedStream, pushPromise.getResponse());
       }
     }
   }

@@ -4,9 +4,6 @@ import com.squareup.okhttp.Headers;
 import com.squareup.okhttp.Request;
 import com.squareup.okhttp.Response;
 import com.squareup.okhttp.internal.Platform;
-import com.squareup.okhttp.internal.Util;
-import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -50,15 +47,8 @@ public final class OkHeaders {
   public static final String RESPONSE_SOURCE = PREFIX + "-Response-Source";
 
   /**
-   * @deprecated OkHttp 2 enforces an enumeration of {@link com.squareup.okhttp.Protocol protocols}
-   * that can be selected. Please use #SELECTED_PROTOCOL
-   */
-  @Deprecated
-  public static final String SELECTED_TRANSPORT = PREFIX + "-Selected-Transport";
-
-  /**
    * Synthetic response header: the selected
-   * {@link com.squareup.okhttp.Protocol protocol} ("spdy/3", "http/1.1", etc).
+   * {@link com.squareup.okhttp.Protocol protocol} ("spdy/3.1", "http/1.1", etc).
    */
   public static final String SELECTED_PROTOCOL = PREFIX + "-Selected-Protocol";
 
@@ -66,11 +56,15 @@ public final class OkHeaders {
   }
 
   public static long contentLength(Request request) {
-    return stringToLong(request.header("Content-Length"));
+    return contentLength(request.headers());
   }
 
   public static long contentLength(Response response) {
-    return stringToLong(response.header("Content-Length"));
+    return contentLength(response.headers());
+  }
+
+  public static long contentLength(Headers headers) {
+    return stringToLong(headers.get("Content-Length"));
   }
 
   private static long stringToLong(String s) {
@@ -130,13 +124,5 @@ public final class OkHeaders {
       sb.append(cookies.get(i));
     }
     return sb.toString();
-  }
-
-  /** Reads headers or trailers into {@code builder}. */
-  public static void readHeaders(Headers.Builder builder, InputStream in) throws IOException {
-    // parse the result headers until the first blank line
-    for (String line; (line = Util.readAsciiLine(in)).length() != 0; ) {
-      builder.addLine(line);
-    }
   }
 }

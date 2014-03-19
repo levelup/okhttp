@@ -25,6 +25,9 @@ import java.io.InputStream;
 import java.net.ProtocolException;
 import java.net.Proxy;
 import java.net.URL;
+import okio.BufferedSink;
+import okio.Okio;
+import okio.Source;
 
 import static com.squareup.okhttp.internal.Util.getEffectivePort;
 import static com.squareup.okhttp.internal.http.HttpURLConnectionImpl.HTTP_MOVED_PERM;
@@ -45,7 +48,7 @@ final class Job extends NamedRunnable {
 
   /** The request; possibly a consequence of redirects or auth headers. */
   private Request request;
-  private HttpEngine engine;
+  HttpEngine engine;
 
   public Job(Dispatcher dispatcher, OkHttpClient client, Request request,
       Response.Receiver responseReceiver) {
@@ -80,7 +83,7 @@ final class Job extends NamedRunnable {
           .exception(e)
           .build());
     } finally {
-      engine.release(true); // Release the connection if it isn't already released.
+      engine.close(); // Close the connection if it isn't already.
       dispatcher.finished(this);
     }
   }
@@ -89,7 +92,7 @@ final class Job extends NamedRunnable {
    * Performs the request and returns the response. May return null if this job
    * was canceled.
    */
-  private Response getResponse() throws IOException {
+  Response getResponse() throws IOException {
     Response redirectedBy = null;
 
     // Copy body metadata to the appropriate request headers.
@@ -123,7 +126,9 @@ final class Job extends NamedRunnable {
         engine.sendRequest();
 
         if (body != null) {
-          body.writeTo(engine.getRequestBody());
+          BufferedSink sink = Okio.buffer(engine.getRequestBody());
+          body.writeTo(sink);
+          sink.flush();
         }
 
         engine.readResponse();
@@ -142,7 +147,7 @@ final class Job extends NamedRunnable {
       Request redirect = processResponse(engine, response);
 
       if (redirect == null) {
-        engine.automaticallyReleaseConnectionToPool();
+        engine.releaseConnection();
         return response.newBuilder()
             .body(new RealResponseBody(response, engine.getResponseBody()))
             .redirectedBy(redirectedBy)
@@ -150,11 +155,10 @@ final class Job extends NamedRunnable {
       }
 
       if (!sameConnection(request, redirect)) {
-        engine.automaticallyReleaseConnectionToPool();
+        engine.releaseConnection();
       }
 
-      engine.release(false);
-      Connection connection = engine.getConnection();
+      Connection connection = engine.close();
       redirectedBy = response.newBuilder().redirectedBy(redirectedBy).build(); // Chained.
       request = redirect;
       engine = new HttpEngine(client, request, false, connection, null, null);
@@ -229,11 +233,14 @@ final class Job extends NamedRunnable {
 
   static class RealResponseBody extends Response.Body {
     private final Response response;
-    private final InputStream in;
+    private final Source source;
 
-    RealResponseBody(Response response, InputStream in) {
+    /** Multiple calls to {@link #byteStream} must return the same instance. */
+    private InputStream in;
+
+    RealResponseBody(Response response, Source source) {
       this.response = response;
-      this.in = in;
+      this.source = source;
     }
 
     @Override public boolean ready() throws IOException {
@@ -249,8 +256,15 @@ final class Job extends NamedRunnable {
       return OkHeaders.contentLength(response);
     }
 
+    @Override public Source source() {
+      return source;
+    }
+
     @Override public InputStream byteStream() {
-      return in;
+      InputStream result = in;
+      return result != null
+          ? result
+          : (in = Okio.buffer(source).inputStream());
     }
   }
 }

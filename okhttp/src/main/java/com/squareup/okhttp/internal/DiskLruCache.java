@@ -16,7 +16,6 @@
 
 package com.squareup.okhttp.internal;
 
-import java.io.BufferedWriter;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.File;
@@ -26,19 +25,19 @@ import java.io.FileOutputStream;
 import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.Callable;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import okio.BufferedSink;
+import okio.BufferedSource;
+import okio.OkBuffer;
+import okio.Okio;
 
 /**
  * A cache that uses a bounded amount of space on a filesystem. Each cache
@@ -145,7 +144,7 @@ public final class DiskLruCache implements Closeable {
   private long maxSize;
   private final int valueCount;
   private long size = 0;
-  private Writer journalWriter;
+  private BufferedSink journalWriter;
   private final LinkedHashMap<String, Entry> lruEntries =
       new LinkedHashMap<String, Entry>(0, 0.75f, true);
   private int redundantOpCount;
@@ -160,19 +159,22 @@ public final class DiskLruCache implements Closeable {
   /** This cache uses a single background thread to evict entries. */
   final ThreadPoolExecutor executorService = new ThreadPoolExecutor(0, 1, 60L, TimeUnit.SECONDS,
       new LinkedBlockingQueue<Runnable>(), Util.threadFactory("OkHttp DiskLruCache", true));
-  private final Callable<Void> cleanupCallable = new Callable<Void>() {
-    public Void call() throws Exception {
+  private final Runnable cleanupRunnable = new Runnable() {
+    public void run() {
       synchronized (DiskLruCache.this) {
         if (journalWriter == null) {
-          return null; // Closed.
+          return; // Closed.
         }
-        trimToSize();
-        if (journalRebuildRequired()) {
-          rebuildJournal();
-          redundantOpCount = 0;
+        try {
+          trimToSize();
+          if (journalRebuildRequired()) {
+            rebuildJournal();
+            redundantOpCount = 0;
+          }
+        } catch (IOException e) {
+          throw new RuntimeException(e);
         }
       }
-      return null;
     }
   };
 
@@ -222,8 +224,7 @@ public final class DiskLruCache implements Closeable {
       try {
         cache.readJournal();
         cache.processJournal();
-        cache.journalWriter = new BufferedWriter(
-            new OutputStreamWriter(new FileOutputStream(cache.journalFile, true), Util.US_ASCII));
+        cache.journalWriter = Okio.buffer(Okio.sink(new FileOutputStream(cache.journalFile, true)));
         return cache;
       } catch (IOException journalIsCorrupt) {
         Platform.get().logW("DiskLruCache " + directory + " is corrupt: "
@@ -240,13 +241,13 @@ public final class DiskLruCache implements Closeable {
   }
 
   private void readJournal() throws IOException {
-    StrictLineReader reader = new StrictLineReader(new FileInputStream(journalFile), Util.US_ASCII);
+    BufferedSource source = Okio.buffer(Okio.source(new FileInputStream(journalFile)));
     try {
-      String magic = reader.readLine();
-      String version = reader.readLine();
-      String appVersionString = reader.readLine();
-      String valueCountString = reader.readLine();
-      String blank = reader.readLine();
+      String magic = source.readUtf8LineStrict();
+      String version = source.readUtf8LineStrict();
+      String appVersionString = source.readUtf8LineStrict();
+      String valueCountString = source.readUtf8LineStrict();
+      String blank = source.readUtf8LineStrict();
       if (!MAGIC.equals(magic)
           || !VERSION_1.equals(version)
           || !Integer.toString(appVersion).equals(appVersionString)
@@ -259,7 +260,7 @@ public final class DiskLruCache implements Closeable {
       int lineCount = 0;
       while (true) {
         try {
-          readJournalLine(reader.readLine());
+          readJournalLine(source.readUtf8LineStrict());
           lineCount++;
         } catch (EOFException endOfJournal) {
           break;
@@ -267,7 +268,7 @@ public final class DiskLruCache implements Closeable {
       }
       redundantOpCount = lineCount - lruEntries.size();
     } finally {
-      Util.closeQuietly(reader);
+      Util.closeQuietly(source);
     }
   }
 
@@ -342,24 +343,23 @@ public final class DiskLruCache implements Closeable {
       journalWriter.close();
     }
 
-    Writer writer = new BufferedWriter(
-        new OutputStreamWriter(new FileOutputStream(journalFileTmp), Util.US_ASCII));
+    BufferedSink writer = Okio.buffer(Okio.sink(new FileOutputStream(journalFileTmp)));
     try {
-      writer.write(MAGIC);
-      writer.write("\n");
-      writer.write(VERSION_1);
-      writer.write("\n");
-      writer.write(Integer.toString(appVersion));
-      writer.write("\n");
-      writer.write(Integer.toString(valueCount));
-      writer.write("\n");
-      writer.write("\n");
+      writer.writeUtf8(MAGIC);
+      writer.writeUtf8("\n");
+      writer.writeUtf8(VERSION_1);
+      writer.writeUtf8("\n");
+      writer.writeUtf8(Integer.toString(appVersion));
+      writer.writeUtf8("\n");
+      writer.writeUtf8(Integer.toString(valueCount));
+      writer.writeUtf8("\n");
+      writer.writeUtf8("\n");
 
       for (Entry entry : lruEntries.values()) {
         if (entry.currentEditor != null) {
-          writer.write(DIRTY + ' ' + entry.key + '\n');
+          writer.writeUtf8(DIRTY + ' ' + entry.key + '\n');
         } else {
-          writer.write(CLEAN + ' ' + entry.key + entry.getLengths() + '\n');
+          writer.writeUtf8(CLEAN + ' ' + entry.key + entry.getLengths() + '\n');
         }
       }
     } finally {
@@ -372,13 +372,13 @@ public final class DiskLruCache implements Closeable {
     renameTo(journalFileTmp, journalFile, false);
     journalFileBackup.delete();
 
-    journalWriter = new BufferedWriter(
-        new OutputStreamWriter(new FileOutputStream(journalFile, true), Util.US_ASCII));
+    journalWriter = Okio.buffer(Okio.sink(new FileOutputStream(journalFile, true)));
   }
 
   private static void deleteIfExists(File file) throws IOException {
-    if (file.exists() && !file.delete()) {
-      throw new IOException();
+    // If delete() fails, make sure it's because the file didn't exist!
+    if (!file.delete() && file.exists()) {
+      throw new IOException("failed to delete " + file);
     }
   }
 
@@ -429,9 +429,9 @@ public final class DiskLruCache implements Closeable {
     }
 
     redundantOpCount++;
-    journalWriter.append(READ + ' ' + key + '\n');
+    journalWriter.writeUtf8(READ + ' ' + key + '\n');
     if (journalRebuildRequired()) {
-      executorService.submit(cleanupCallable);
+      executorService.execute(cleanupRunnable);
     }
 
     return new Snapshot(key, entry.sequenceNumber, ins, entry.lengths);
@@ -464,7 +464,7 @@ public final class DiskLruCache implements Closeable {
     entry.currentEditor = editor;
 
     // Flush the journal before creating files to prevent file leaks.
-    journalWriter.write(DIRTY + ' ' + key + '\n');
+    journalWriter.writeUtf8(DIRTY + ' ' + key + '\n');
     journalWriter.flush();
     return editor;
   }
@@ -478,7 +478,7 @@ public final class DiskLruCache implements Closeable {
    * Returns the maximum number of bytes that this cache should use to store
    * its data.
    */
-  public long getMaxSize() {
+  public synchronized long getMaxSize() {
     return maxSize;
   }
 
@@ -488,7 +488,7 @@ public final class DiskLruCache implements Closeable {
    */
   public synchronized void setMaxSize(long maxSize) {
     this.maxSize = maxSize;
-    executorService.submit(cleanupCallable);
+    executorService.execute(cleanupRunnable);
   }
 
   /**
@@ -540,18 +540,18 @@ public final class DiskLruCache implements Closeable {
     entry.currentEditor = null;
     if (entry.readable | success) {
       entry.readable = true;
-      journalWriter.write(CLEAN + ' ' + entry.key + entry.getLengths() + '\n');
+      journalWriter.writeUtf8(CLEAN + ' ' + entry.key + entry.getLengths() + '\n');
       if (success) {
         entry.sequenceNumber = nextSequenceNumber++;
       }
     } else {
       lruEntries.remove(entry.key);
-      journalWriter.write(REMOVE + ' ' + entry.key + '\n');
+      journalWriter.writeUtf8(REMOVE + ' ' + entry.key + '\n');
     }
     journalWriter.flush();
 
     if (size > maxSize || journalRebuildRequired()) {
-      executorService.submit(cleanupCallable);
+      executorService.execute(cleanupRunnable);
     }
   }
 
@@ -581,19 +581,17 @@ public final class DiskLruCache implements Closeable {
 
     for (int i = 0; i < valueCount; i++) {
       File file = entry.getCleanFile(i);
-      if (!file.delete()) {
-        throw new IOException("failed to delete " + file);
-      }
+      deleteIfExists(file);
       size -= entry.lengths[i];
       entry.lengths[i] = 0;
     }
 
     redundantOpCount++;
-    journalWriter.append(REMOVE + ' ' + key + '\n');
+    journalWriter.writeUtf8(REMOVE + ' ' + key + '\n');
     lruEntries.remove(key);
 
     if (journalRebuildRequired()) {
-      executorService.submit(cleanupCallable);
+      executorService.execute(cleanupRunnable);
     }
 
     return true;
@@ -659,7 +657,8 @@ public final class DiskLruCache implements Closeable {
   }
 
   private static String inputStreamToString(InputStream in) throws IOException {
-    return Util.readFully(new InputStreamReader(in, Util.UTF_8));
+    OkBuffer buffer = Util.readFully(Okio.source(in));
+    return buffer.readUtf8(buffer.size());
   }
 
   /** A snapshot of the values for an entry. */
@@ -790,13 +789,9 @@ public final class DiskLruCache implements Closeable {
 
     /** Sets the value at {@code index} to {@code value}. */
     public void set(int index, String value) throws IOException {
-      Writer writer = null;
-      try {
-        writer = new OutputStreamWriter(newOutputStream(index), Util.UTF_8);
-        writer.write(value);
-      } finally {
-        Util.closeQuietly(writer);
-      }
+      BufferedSink writer = Okio.buffer(Okio.sink(newOutputStream(index)));
+      writer.writeUtf8(value);
+      writer.close();
     }
 
     /**

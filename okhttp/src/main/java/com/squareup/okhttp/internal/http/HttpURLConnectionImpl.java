@@ -18,13 +18,13 @@
 package com.squareup.okhttp.internal.http;
 
 import com.squareup.okhttp.Connection;
+import com.squareup.okhttp.Handshake;
 import com.squareup.okhttp.Headers;
 import com.squareup.okhttp.OkHttpClient;
 import com.squareup.okhttp.Protocol;
 import com.squareup.okhttp.Request;
 import com.squareup.okhttp.Response;
 import com.squareup.okhttp.Route;
-import com.squareup.okhttp.internal.ByteString;
 import com.squareup.okhttp.internal.Platform;
 import com.squareup.okhttp.internal.Util;
 import java.io.FileNotFoundException;
@@ -45,6 +45,9 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import okio.BufferedSink;
+import okio.ByteString;
+import okio.Sink;
 
 import static com.squareup.okhttp.internal.Util.getEffectivePort;
 import static com.squareup.okhttp.internal.http.StatusLine.HTTP_TEMP_REDIRECT;
@@ -85,6 +88,12 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
    */
   private Route route;
 
+  /**
+   * The most recently received TLS handshake. This will be null if we haven't
+   * connected yet, or if the most recent connection was HTTP (and not HTTPS).
+   */
+  Handshake handshake;
+
   public HttpURLConnectionImpl(URL url, OkHttpClient client) {
     super(url);
     this.client = client;
@@ -101,15 +110,7 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
   @Override public final void disconnect() {
     // Calling disconnect() before a connection exists should have no effect.
     if (httpEngine != null) {
-      // We close the response body here instead of in
-      // HttpEngine.release because that is called when input
-      // has been completely read from the underlying socket.
-      // However the response body can be a GZIPInputStream that
-      // still has unread data.
-      if (httpEngine.hasResponse()) {
-        Util.closeQuietly(httpEngine.getResponseBody());
-      }
-      httpEngine.release(true);
+      httpEngine.close();
     }
   }
 
@@ -121,7 +122,7 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
     try {
       HttpEngine response = getResponse();
       if (response.hasResponseBody() && response.getResponse().code() >= HTTP_BAD_REQUEST) {
-        return response.getResponseBody();
+        return response.getResponseBodyBytes();
       }
       return null;
     } catch (IOException e) {
@@ -178,10 +179,7 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
           "Cannot access request header fields after connection is set");
     }
 
-    // For the request line property assigned to the null key, just use no proxy and HTTP 1.1.
-    Request request = new Request.Builder().url(getURL()).method(method, null).build();
-    String requestLine = RequestLine.get(request, null, 1);
-    return OkHeaders.toMultimap(requestHeaders.build(), requestLine);
+    return OkHeaders.toMultimap(requestHeaders.build(), null);
   }
 
   @Override public final InputStream getInputStream() throws IOException {
@@ -199,7 +197,7 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
       throw new FileNotFoundException(url.toString());
     }
 
-    InputStream result = response.getResponseBody();
+    InputStream result = response.getResponseBodyBytes();
     if (result == null) {
       throw new ProtocolException("No response body exists; responseCode=" + getResponseCode());
     }
@@ -209,14 +207,14 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
   @Override public final OutputStream getOutputStream() throws IOException {
     connect();
 
-    OutputStream out = httpEngine.getRequestBody();
-    if (out == null) {
+    BufferedSink sink = httpEngine.getBufferedRequestBody();
+    if (sink == null) {
       throw new ProtocolException("method does not support a request body: " + method);
     } else if (httpEngine.hasResponse()) {
       throw new ProtocolException("cannot write request body after response has been read");
     }
 
-    return out;
+    return sink.outputStream();
   }
 
   @Override public final Permission getPermission() throws IOException {
@@ -264,7 +262,7 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
         if (method.equals("GET")) {
           // they are requesting a stream to write to. This implies a POST method
           method = "POST";
-        } else if (!method.equals("POST") && !method.equals("PUT") && !method.equals("PATCH")) {
+        } else if (!HttpMethod.hasRequestBody(method)) {
           // If the request method is neither POST nor PUT nor PATCH, then you're not writing
           throw new ProtocolException(method + " does not support writing");
         }
@@ -277,7 +275,7 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
   }
 
   private HttpEngine newHttpEngine(String method, Connection connection,
-      RetryableOutputStream requestBody) {
+      RetryableSink requestBody) {
     Request.Builder builder = new Request.Builder()
         .url(getURL())
         .method(method, null /* No body; that's passed separately. */);
@@ -327,13 +325,13 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
 
       Retry retry = processResponseHeaders();
       if (retry == Retry.NONE) {
-        httpEngine.automaticallyReleaseConnectionToPool();
+        httpEngine.releaseConnection();
         return httpEngine;
       }
 
       // The first request was insufficient. Prepare for another...
       String retryMethod = method;
-      OutputStream requestBody = httpEngine.getRequestBody();
+      Sink requestBody = httpEngine.getRequestBody();
 
       // Although RFC 2616 10.3.2 specifies that a HTTP_MOVED_PERM
       // redirect should keep the same method, Chrome, Firefox and the
@@ -348,17 +346,16 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
         requestBody = null;
       }
 
-      if (requestBody != null && !(requestBody instanceof RetryableOutputStream)) {
+      if (requestBody != null && !(requestBody instanceof RetryableSink)) {
         throw new HttpRetryException("Cannot retry streamed HTTP body", responseCode);
       }
 
       if (retry == Retry.DIFFERENT_CONNECTION) {
-        httpEngine.automaticallyReleaseConnectionToPool();
+        httpEngine.releaseConnection();
       }
 
-      httpEngine.release(false);
-      httpEngine = newHttpEngine(retryMethod, httpEngine.getConnection(),
-          (RetryableOutputStream) requestBody);
+      Connection connection = httpEngine.close();
+      httpEngine = newHttpEngine(retryMethod, connection, (RetryableSink) requestBody);
     }
   }
 
@@ -371,6 +368,9 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
     try {
       httpEngine.sendRequest();
       route = httpEngine.getRoute();
+      handshake = httpEngine.getConnection() != null
+          ? httpEngine.getConnection().getHandshake()
+          : null;
       if (readResponse) {
         httpEngine.readResponse();
       }
@@ -565,6 +565,14 @@ public class HttpURLConnectionImpl extends HttpURLConnection {
       }
     }
     client.setProtocols(protocolsList);
+  }
+
+  @Override public void setRequestMethod(String method) throws ProtocolException {
+    if (!HttpMethod.METHODS.contains(method)) {
+      throw new ProtocolException(
+          "Expected one of " + HttpMethod.METHODS + " but was " + method);
+    }
+    this.method = method;
   }
 
   @Override public void setFixedLengthStreamingMode(int contentLength) {
