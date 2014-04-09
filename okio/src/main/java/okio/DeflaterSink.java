@@ -15,9 +15,10 @@
  */
 package okio;
 
+import android.annotation.TargetApi;
+import android.os.Build;
 import java.io.IOException;
 import java.util.zip.Deflater;
-import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
 import static okio.Util.checkOffsetAndCount;
 
@@ -69,7 +70,7 @@ public final class DeflaterSink implements Sink {
     }
   }
 
-  @IgnoreJRERequirement
+  @TargetApi(Build.VERSION_CODES.KITKAT)
   private void deflate(boolean syncFlush) throws IOException {
     OkBuffer buffer = sink.buffer();
     while (true) {

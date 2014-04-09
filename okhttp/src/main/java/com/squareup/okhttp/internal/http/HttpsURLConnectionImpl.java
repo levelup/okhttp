@@ -16,6 +16,8 @@
  */
 package com.squareup.okhttp.internal.http;
 
+import android.annotation.TargetApi;
+import android.os.Build;
 import com.squareup.okhttp.Handshake;
 import com.squareup.okhttp.OkHttpClient;
 import java.net.URL;
@@ -63,15 +65,8 @@ public final class HttpsURLConnectionImpl extends DelegatingHttpsURLConnection {
     return delegate.client.getSslSocketFactory();
   }
 
-  @Override public long getContentLengthLong() {
-    return delegate.getContentLengthLong();
-  }
-
+  @TargetApi(Build.VERSION_CODES.KITKAT)
   @Override public void setFixedLengthStreamingMode(long contentLength) {
     delegate.setFixedLengthStreamingMode(contentLength);
-  }
-
-  @Override public long getHeaderFieldLong(String field, long defaultValue) {
-    return delegate.getHeaderFieldLong(field, defaultValue);
   }
 }

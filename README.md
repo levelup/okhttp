@@ -1,3 +1,5 @@
+# This fork is mainly to build in Eclipse for Android, the code doesn't differ from the main repository #
+
 OkHttp
 ======
 

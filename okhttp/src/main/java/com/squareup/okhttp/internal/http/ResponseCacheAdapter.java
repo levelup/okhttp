@@ -15,6 +15,8 @@
  */
 package com.squareup.okhttp.internal.http;
 
+import android.annotation.TargetApi;
+import android.os.Build;
 import com.squareup.okhttp.OkResponseCache;
 import com.squareup.okhttp.Request;
 import com.squareup.okhttp.Response;
