@@ -30,7 +30,7 @@ import com.squareup.okhttp.internal.okio.ByteString;
  * indicate how HTTP messages are framed.
  */
 public enum Protocol {
-  HTTP_2("HTTP-draft-09/2.0", true),
+  HTTP_2("h2-10", true),
   SPDY_3("spdy/3.1", true),
   HTTP_11("http/1.1", false);
 
