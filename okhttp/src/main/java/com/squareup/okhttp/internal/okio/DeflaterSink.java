@@ -15,9 +15,10 @@
  */
 package com.squareup.okhttp.internal.okio;
 
+import android.annotation.TargetApi;
+import android.os.Build;
 import java.io.IOException;
 import java.util.zip.Deflater;
-import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
 import static com.squareup.okhttp.internal.okio.Util.checkOffsetAndCount;
 
@@ -69,7 +70,8 @@ public final class DeflaterSink implements Sink {
     }
   }
 
-  @IgnoreJRERequirement
+  //@IgnoreJRERequirement
+  @TargetApi(Build.VERSION_CODES.KITKAT)
   private void deflate(boolean syncFlush) throws IOException {
     OkBuffer buffer = sink.buffer();
     while (true) {

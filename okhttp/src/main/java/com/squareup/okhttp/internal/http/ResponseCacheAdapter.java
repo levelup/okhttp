@@ -15,6 +15,8 @@
  */
 package com.squareup.okhttp.internal.http;
 
+import android.annotation.TargetApi;
+import android.os.Build;
 import com.squareup.okhttp.Handshake;
 import com.squareup.okhttp.MediaType;
 import com.squareup.okhttp.OkResponseCache;
@@ -523,16 +525,9 @@ public class ResponseCacheAdapter implements OkResponseCache {
       throw throwRequestSslAccessException();
     }
 
-    @Override public long getContentLengthLong() {
-      return delegate.getContentLengthLong();
-    }
-
-    @Override public void setFixedLengthStreamingMode(long contentLength) {
+    @TargetApi(Build.VERSION_CODES.KITKAT)
+	@Override public void setFixedLengthStreamingMode(long contentLength) {
       delegate.setFixedLengthStreamingMode(contentLength);
-    }
-
-    @Override public long getHeaderFieldLong(String field, long defaultValue) {
-      return delegate.getHeaderFieldLong(field, defaultValue);
     }
   }
 
