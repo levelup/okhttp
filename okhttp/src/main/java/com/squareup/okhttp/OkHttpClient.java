@@ -35,6 +35,7 @@ import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import javax.net.SocketFactory;
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
@@ -45,7 +46,7 @@ import okio.ByteString;
  * OkHttpClient for all of their HTTP requests - benefiting from a shared
  * response cache, thread pool, connection re-use, etc.
  *
- * Instances of OkHttpClient are intended to be fully configured before they're
+ * <p>Instances of OkHttpClient are intended to be fully configured before they're
  * shared - once shared they should be treated as immutable and can safely be used
  * to concurrently open new connections. If required, threads can call
  * {@link #clone()} to make a shallow copy of the OkHttpClient that can be
@@ -60,6 +61,7 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
   private ProxySelector proxySelector;
   private CookieHandler cookieHandler;
   private OkResponseCache responseCache;
+  private SocketFactory socketFactory;
   private SSLSocketFactory sslSocketFactory;
   private HostnameVerifier hostnameVerifier;
   private OkAuthenticator authenticator;
@@ -193,6 +195,21 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
   }
 
   /**
+   * Sets the socket factory used to create connections.
+   *
+   * <p>If unset, the {@link SocketFactory#getDefault() system-wide default}
+   * socket factory will be used.
+   */
+  public OkHttpClient setSocketFactory(SocketFactory socketFactory) {
+    this.socketFactory = socketFactory;
+    return this;
+  }
+
+  public SocketFactory getSocketFactory() {
+    return socketFactory;
+  }
+
+  /**
    * Sets the socket factory used to secure HTTPS connections.
    *
    * <p>If unset, a lazily created SSL socket factory will be used.
@@ -323,7 +340,7 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
    *
    * <p><strong>This is an evolving set.</strong> Future releases may drop
    * support for transitional protocols (like spdy/3.1), in favor of their
-   * successors (spdy/4 or http/2.0). The http/1.1 transport will never be
+   * successors (spdy/4 or hTTP/2). The http/1.1 transport will never be
    * dropped.
    *
    * <p>If multiple protocols are specified, <a
@@ -455,6 +472,9 @@ public final class OkHttpClient implements URLStreamHandlerFactory, Cloneable {
     }
     if (result.responseCache == null) {
       result.responseCache = toOkResponseCache(ResponseCache.getDefault());
+    }
+    if (result.socketFactory == null) {
+      result.socketFactory = SocketFactory.getDefault();
     }
     if (result.sslSocketFactory == null) {
       result.sslSocketFactory = getDefaultSSLSocketFactory();

@@ -18,8 +18,8 @@ package com.squareup.okhttp.internal.spdy;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import okio.Buffer;
 import okio.ByteString;
-import okio.OkBuffer;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -27,24 +27,25 @@ import static com.squareup.okhttp.internal.Util.headerEntries;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
-public class HpackDraft05Test {
+public class HpackDraft06Test {
 
-  private final OkBuffer bytesIn = new OkBuffer();
-  private HpackDraft05.Reader hpackReader;
-  private OkBuffer bytesOut = new OkBuffer();
-  private HpackDraft05.Writer hpackWriter;
+  private final Buffer bytesIn = new Buffer();
+  private HpackDraft06.Reader hpackReader;
+  private Buffer bytesOut = new Buffer();
+  private HpackDraft06.Writer hpackWriter;
 
   @Before public void reset() {
     hpackReader = newReader(bytesIn);
-    hpackWriter = new HpackDraft05.Writer(bytesOut);
+    hpackWriter = new HpackDraft06.Writer(bytesOut);
   }
 
   /**
    * Variable-length quantity special cases strings which are longer than 127
    * bytes.  Values such as cookies can be 4KiB, and should be possible to send.
    *
-   * <p> http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-05#section-4.1.2
+   * <p> http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-06#section-4.1.2
    */
   @Test public void largeHeaderValue() throws IOException {
     char[] value = new char[4096];
@@ -66,7 +67,7 @@ public class HpackDraft05Test {
    * Ensure the larger header content is not lost.
    */
   @Test public void tooLargeToHPackIsStillEmitted() throws IOException {
-    OkBuffer out = new OkBuffer();
+    Buffer out = new Buffer();
 
     out.writeByte(0x00); // Literal indexed
     out.writeByte(0x0a); // Literal name (len = 10)
@@ -87,7 +88,7 @@ public class HpackDraft05Test {
 
   /** Oldest entries are evicted to support newer ones. */
   @Test public void testEviction() throws IOException {
-    OkBuffer out = new OkBuffer();
+    Buffer out = new Buffer();
 
     out.writeByte(0x00); // Literal indexed
     out.writeByte(0x0a); // Literal name (len = 10)
@@ -138,7 +139,7 @@ public class HpackDraft05Test {
 
   /** Header table backing array is initially 8 long, let's ensure it grows. */
   @Test public void dynamicallyGrowsBeyond64Entries() throws IOException {
-    OkBuffer out = new OkBuffer();
+    Buffer out = new Buffer();
 
     for (int i = 0; i < 256; i++) {
       out.writeByte(0x00); // Literal indexed
@@ -160,7 +161,7 @@ public class HpackDraft05Test {
   }
 
   @Test public void huffmanDecodingSupported() throws IOException {
-    OkBuffer out = new OkBuffer();
+    Buffer out = new Buffer();
 
     out.writeByte(0x04); // == Literal indexed ==
                          // Indexed name (idx = 4) -> :path
@@ -185,10 +186,10 @@ public class HpackDraft05Test {
   }
 
   /**
-   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-05#appendix-E.1.1
+   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-06#appendix-D.1.1
    */
   @Test public void readLiteralHeaderFieldWithIndexing() throws IOException {
-    OkBuffer out = new OkBuffer();
+    Buffer out = new Buffer();
 
     out.writeByte(0x00); // Literal indexed
     out.writeByte(0x0a); // Literal name (len = 10)
@@ -217,7 +218,7 @@ public class HpackDraft05Test {
   @Test public void literalHeaderFieldWithoutIndexingNewName() throws IOException {
     List<Header> headerBlock = headerEntries("custom-key", "custom-header");
 
-    OkBuffer expectedBytes = new OkBuffer();
+    Buffer expectedBytes = new Buffer();
 
     expectedBytes.writeByte(0x40); // Not indexed
     expectedBytes.writeByte(0x0a); // Literal name (len = 10)
@@ -239,12 +240,12 @@ public class HpackDraft05Test {
   }
 
   /**
-   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-05#appendix-E.1.2
+   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-06#appendix-D.1.2
    */
   @Test public void literalHeaderFieldWithoutIndexingIndexedName() throws IOException {
     List<Header> headerBlock = headerEntries(":path", "/sample/path");
 
-    OkBuffer expectedBytes = new OkBuffer();
+    Buffer expectedBytes = new Buffer();
     expectedBytes.writeByte(0x44); // == Literal not indexed ==
                                    // Indexed name (idx = 4) -> :path
     expectedBytes.writeByte(0x0c); // Literal value (len = 12)
@@ -263,7 +264,7 @@ public class HpackDraft05Test {
   }
 
   /**
-   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-05#appendix-E.1.3
+   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-06#appendix-D.1.3
    */
   @Test public void readIndexedHeaderField() throws IOException {
     bytesIn.writeByte(0x82); // == Indexed - Add ==
@@ -282,8 +283,69 @@ public class HpackDraft05Test {
     assertEquals(headerEntries(":method", "GET"), hpackReader.getAndReset());
   }
 
+  // Example taken from twitter/hpack DecoderTest.testIllegalIndex
+  @Test public void readIndexedHeaderFieldTooLargeIndex() throws IOException {
+    bytesIn.writeByte(0xff); // == Indexed - Add ==
+    bytesIn.writeByte(0x00); // idx = 127
+
+    try {
+      hpackReader.readHeaders();
+      fail();
+    } catch (IOException e) {
+      assertEquals("Header index too large 127", e.getMessage());
+    }
+  }
+
+  // Example taken from twitter/hpack DecoderTest.testInsidiousIndex
+  @Test public void readIndexedHeaderFieldInsidiousIndex() throws IOException {
+    bytesIn.writeByte(0xff); // == Indexed - Add ==
+    bytesIn.writeByte(0x80); // idx = -2147483521
+    bytesIn.writeByte(0x80);
+    bytesIn.writeByte(0x80);
+    bytesIn.writeByte(0x80);
+    bytesIn.writeByte(0x08);
+
+    try {
+      hpackReader.readHeaders();
+      fail();
+    } catch (IllegalArgumentException e) {
+      assertEquals("input must be between 0 and 63: -2147483514", e.getMessage());
+    }
+  }
+
+  // Example taken from twitter/hpack DecoderTest.testIllegalEncodeContextUpdate
+  @Test public void readHeaderTableStateChangeInvalid() throws IOException {
+    bytesIn.writeByte(0x80); // header table state change
+    bytesIn.writeByte(0x81); // should be 0x80 for empty!
+
+    try {
+      hpackReader.readHeaders();
+      fail();
+    } catch (IOException e) {
+      assertEquals("Invalid header table state change -127", e.getMessage());
+    }
+  }
+
+  // Example taken from twitter/hpack DecoderTest.testInsidiousMaxHeaderSize
+  @Test public void readHeaderTableStateChangeInsidiousMaxHeaderByteCount() throws IOException {
+    bytesIn.writeByte(0x80); // header table state change
+    bytesIn.writeByte(0x7F); // encoded -1879048193
+    bytesIn.writeByte(0x80);
+    bytesIn.writeByte(0xFF);
+    bytesIn.writeByte(0xFF);
+    bytesIn.writeByte(0xFF);
+    bytesIn.writeByte(0x08);
+
+    try {
+      hpackReader.readHeaders();
+      fail();
+    } catch (IOException e) {
+      assertEquals("Invalid header table byte count -1879048193", e.getMessage());
+    }
+  }
+
   /**
-   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-05#section-3.2.1
+   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-06#section-3.2.1
    */
   @Test public void toggleIndex() throws IOException {
     // Static table entries are copied to the top of the reference set.
@@ -349,7 +411,7 @@ public class HpackDraft05Test {
   }
 
   /**
-   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-05#appendix-E.1.4
+   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-06#appendix-D.1.4
    */
   @Test public void readIndexedHeaderFieldFromStaticTableWithoutBuffering() throws IOException {
     bytesIn.writeByte(0x82); // == Indexed - Add ==
@@ -366,10 +428,10 @@ public class HpackDraft05Test {
   }
 
   /**
-   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-05#appendix-E.2
+   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-06#appendix-D.2
    */
   @Test public void readRequestExamplesWithoutHuffman() throws IOException {
-    OkBuffer out = firstRequestWithoutHuffman();
+    Buffer out = firstRequestWithoutHuffman();
     bytesIn.write(out, out.size());
     hpackReader.readHeaders();
     hpackReader.emitReferenceSet();
@@ -388,8 +450,8 @@ public class HpackDraft05Test {
     checkReadThirdRequestWithoutHuffman();
   }
 
-  private OkBuffer firstRequestWithoutHuffman() {
-    OkBuffer out = new OkBuffer();
+  private Buffer firstRequestWithoutHuffman() {
+    Buffer out = new Buffer();
 
     out.writeByte(0x82); // == Indexed - Add ==
                          // idx = 2 -> :method: GET
@@ -439,8 +501,8 @@ public class HpackDraft05Test {
         ":authority", "www.example.com"), hpackReader.getAndReset());
   }
 
-  private OkBuffer secondRequestWithoutHuffman() {
-    OkBuffer out = new OkBuffer();
+  private Buffer secondRequestWithoutHuffman() {
+    Buffer out = new Buffer();
 
     out.writeByte(0x1b); // == Literal indexed ==
                          // Indexed name (idx = 27) -> cache-control
@@ -490,10 +552,11 @@ public class HpackDraft05Test {
         "cache-control", "no-cache"), hpackReader.getAndReset());
   }
 
-  private OkBuffer thirdRequestWithoutHuffman() {
-    OkBuffer out = new OkBuffer();
+  private Buffer thirdRequestWithoutHuffman() {
+    Buffer out = new Buffer();
 
     out.writeByte(0x80); // == Empty reference set ==
+    out.writeByte(0x80); // idx = 0, flag = 1
     out.writeByte(0x85); // == Indexed - Add ==
                          // idx = 5 -> :method: GET
     out.writeByte(0x8c); // == Indexed - Add ==
@@ -568,10 +631,10 @@ public class HpackDraft05Test {
   }
 
   /**
-   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-05#appendix-E.3
+   * http://tools.ietf.org/html/draft-ietf-httpbis-header-compression-06#appendix-D.3
    */
   @Test public void readRequestExamplesWithHuffman() throws IOException {
-    OkBuffer out = firstRequestWithHuffman();
+    Buffer out = firstRequestWithHuffman();
     bytesIn.write(out, out.size());
     hpackReader.readHeaders();
     hpackReader.emitReferenceSet();
@@ -590,8 +653,8 @@ public class HpackDraft05Test {
     checkReadThirdRequestWithHuffman();
   }
 
-  private OkBuffer firstRequestWithHuffman() {
-    OkBuffer out = new OkBuffer();
+  private Buffer firstRequestWithHuffman() {
+    Buffer out = new Buffer();
 
     out.writeByte(0x82); // == Indexed - Add ==
                          // idx = 2 -> :method: GET
@@ -646,8 +709,8 @@ public class HpackDraft05Test {
         ":authority", "www.example.com"), hpackReader.getAndReset());
   }
 
-  private OkBuffer secondRequestWithHuffman() {
-    OkBuffer out = new OkBuffer();
+  private Buffer secondRequestWithHuffman() {
+    Buffer out = new Buffer();
 
     out.writeByte(0x1b); // == Literal indexed ==
                          // Indexed name (idx = 27) -> cache-control
@@ -701,10 +764,11 @@ public class HpackDraft05Test {
         "cache-control", "no-cache"), hpackReader.getAndReset());
   }
 
-  private OkBuffer thirdRequestWithHuffman() {
-    OkBuffer out = new OkBuffer();
+  private Buffer thirdRequestWithHuffman() {
+    Buffer out = new Buffer();
 
     out.writeByte(0x80); // == Empty reference set ==
+    out.writeByte(0x80); // idx = 0, flag = 1
     out.writeByte(0x85); // == Indexed - Add ==
                          // idx = 5 -> :method: GET
     out.writeByte(0x8c); // == Indexed - Add ==
@@ -848,12 +912,12 @@ public class HpackDraft05Test {
     assertEquals(ByteString.EMPTY, newReader(byteStream(0)).readByteString(false));
   }
 
-  private HpackDraft05.Reader newReader(OkBuffer source) {
-    return new HpackDraft05.Reader(false, 4096, source);
+  private HpackDraft06.Reader newReader(Buffer source) {
+    return new HpackDraft06.Reader(4096, source);
   }
 
-  private OkBuffer byteStream(int... bytes) {
-    return new OkBuffer().write(intArrayToByteArray(bytes));
+  private Buffer byteStream(int... bytes) {
+    return new Buffer().write(intArrayToByteArray(bytes));
   }
 
   private void checkEntry(Header entry, String name, String value, int size) {

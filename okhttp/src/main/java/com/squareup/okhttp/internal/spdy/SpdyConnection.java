@@ -33,10 +33,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import okio.Buffer;
 import okio.BufferedSink;
 import okio.BufferedSource;
 import okio.ByteString;
-import okio.OkBuffer;
 import okio.Okio;
 
 import static com.squareup.okhttp.internal.spdy.Settings.DEFAULT_INITIAL_WINDOW_SIZE;
@@ -128,7 +128,8 @@ public final class SpdyConnection implements Closeable {
     pushObserver = builder.pushObserver;
     client = builder.client;
     handler = builder.handler;
-    nextStreamId = builder.client ? 1 : 2;
+    // http://tools.ietf.org/html/draft-ietf-httpbis-http2-10#section-5.1.1
+    nextStreamId = builder.client ? 3 : 2; // 1 on client is reserved for Upgrade
     nextPingId = builder.client ? 1 : 2;
 
     // Flow control was designed more for servers, or proxies than edge clients.
@@ -143,7 +144,7 @@ public final class SpdyConnection implements Closeable {
 
     Variant variant;
     if (protocol == Protocol.HTTP_2) {
-      variant = new Http20Draft09();
+      variant = new Http20Draft10();
     } else if (protocol == Protocol.SPDY_3) {
       variant = new Spdy3();
     } else {
@@ -287,7 +288,7 @@ public final class SpdyConnection implements Closeable {
    * will not block.  The only use case for zero {@code byteCount} is closing
    * a flushed output stream.
    */
-  public void writeData(int streamId, boolean outFinished, OkBuffer buffer, long byteCount)
+  public void writeData(int streamId, boolean outFinished, Buffer buffer, long byteCount)
       throws IOException {
     if (byteCount == 0) { // Empty data frames are not flow-controlled.
       frameWriter.data(outFinished, streamId, buffer, 0);
@@ -809,7 +810,7 @@ public final class SpdyConnection implements Closeable {
    */
   private void pushDataLater(final int streamId, final BufferedSource source, final int byteCount,
       final boolean inFinished) throws IOException {
-    final OkBuffer buffer = new OkBuffer();
+    final Buffer buffer = new Buffer();
     source.require(byteCount); // Eagerly read the frame before firing client thread.
     source.read(buffer, byteCount);
     if (buffer.size() != byteCount) throw new IOException(buffer.size() + " != " + byteCount);
